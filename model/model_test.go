@@ -106,7 +106,7 @@ func (*testModelSuite) TestModelBasic(c *C) {
 	has := index.HasPrefixIndex()
 	c.Assert(has, Equals, true)
 	t := table.GetUpdateTime()
-	c.Assert(t, Equals, tsConvert2Time(table.UpdateTS))
+	c.Assert(t, Equals, TSConvert2Time(table.UpdateTS))
 
 	// Corner cases
 	column.Flag ^= mysql.PriKeyFlag
@@ -132,7 +132,7 @@ func (*testModelSuite) TestJobStartTime(c *C) {
 		BinlogInfo: &HistoryInfo{},
 	}
 	t := time.Unix(0, 0)
-	c.Assert(t, Equals, tsConvert2Time(job.StartTS))
+	c.Assert(t, Equals, TSConvert2Time(job.StartTS))
 	ret := fmt.Sprintf("%s", job)
 	c.Assert(job.String(), Equals, ret)
 }
@@ -286,4 +286,22 @@ func (testModelSuite) TestString(c *C) {
 		str := v.act.String()
 		c.Assert(str, Equals, v.result)
 	}
+}
+
+func (testModelSuite) TestUnmarshalCIStr(c *C) {
+	var ci CIStr
+
+	// Test unmarshal CIStr from a single string.
+	str := "aaBB"
+	buf, err := json.Marshal(str)
+	c.Assert(err, IsNil)
+	ci.UnmarshalJSON(buf)
+	c.Assert(ci.O, Equals, str)
+	c.Assert(ci.L, Equals, "aabb")
+
+	buf, err = json.Marshal(ci)
+	c.Assert(string(buf), Equals, `{"O":"aaBB","L":"aabb"}`)
+	ci.UnmarshalJSON(buf)
+	c.Assert(ci.O, Equals, str)
+	c.Assert(ci.L, Equals, "aabb")
 }

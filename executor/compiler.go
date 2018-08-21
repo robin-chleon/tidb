@@ -103,7 +103,7 @@ func isExpensiveQuery(p plan.Plan) bool {
 
 func isPhysicalPlanExpensive(p plan.PhysicalPlan) bool {
 	expensiveRowThreshold := int64(config.GetGlobalConfig().Log.ExpensiveThreshold)
-	if p.StatsInfo().Count() > expensiveRowThreshold {
+	if int64(p.StatsCount()) > expensiveRowThreshold {
 		return true
 	}
 
@@ -195,7 +195,7 @@ func GetInfoSchema(ctx sessionctx.Context) infoschema.InfoSchema {
 	var is infoschema.InfoSchema
 	if snap := sessVar.SnapshotInfoschema; snap != nil {
 		is = snap.(infoschema.InfoSchema)
-		log.Infof("[%d] use snapshot schema %d", sessVar.ConnectionID, is.SchemaMetaVersion())
+		log.Infof("con:%d use snapshot schema %d", sessVar.ConnectionID, is.SchemaMetaVersion())
 	} else {
 		is = sessVar.TxnCtx.InfoSchema.(infoschema.InfoSchema)
 	}

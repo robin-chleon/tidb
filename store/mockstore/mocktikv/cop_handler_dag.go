@@ -15,7 +15,9 @@ package mocktikv
 
 import (
 	"bytes"
+	"fmt"
 	"io"
+	"sync"
 	"time"
 
 	"github.com/golang/protobuf/proto"
@@ -35,13 +37,57 @@ import (
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util/codec"
 	mockpkg "github.com/pingcap/tidb/util/mock"
-	tipb "github.com/pingcap/tipb/go-tipb"
+	"github.com/pingcap/tipb/go-tipb"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"
 )
 
 var dummySlice = make([]byte, 0)
+
+// locCache is a simple map with lock. It stores all used timezone during the lifetime of tidb instance.
+// Talked with Golang team about whether they can have some forms of cache policy available for programmer,
+// they suggests that only programmers knows which one is best for their use case.
+// For detail, please refer to: https://github.com/golang/go/issues/26106
+type locCache struct {
+	sync.RWMutex
+	// locMap stores locations used in past and can be retrieved by a timezone's name.
+	locMap map[string]*time.Location
+}
+
+// init initializes `locCache`.
+func init() {
+	LocCache = &locCache{}
+	LocCache.locMap = make(map[string]*time.Location)
+}
+
+// LocCache is a simple cache policy to improve the performance of 'time.LoadLocation'.
+var LocCache *locCache
+
+// getLoc first trying to load location from a cache map. If nothing found in such map, then call
+// `time.LocadLocation` to get a timezone location. After trying both way, an error wil be returned
+//  if valid Location is not found.
+func (lm *locCache) getLoc(name string) (*time.Location, error) {
+	if name == "System" {
+		name = "Local"
+	}
+	lm.RLock()
+	if v, ok := lm.locMap[name]; ok {
+		lm.RUnlock()
+		return v, nil
+	}
+
+	if loc, err := time.LoadLocation(name); err == nil {
+		lm.RUnlock()
+		lm.Lock()
+		lm.locMap[name] = loc
+		lm.Unlock()
+		return loc, nil
+	}
+
+	lm.RUnlock()
+	return nil, fmt.Errorf("invalid name for timezone %s", name)
+}
 
 type dagContext struct {
 	dagReq    *tipb.DAGRequest
@@ -99,8 +145,13 @@ func (h *rpcHandler) buildDAGExecutor(req *coprocessor.Request) (*dagContext, ex
 	if err != nil {
 		return nil, nil, nil, errors.Trace(err)
 	}
+
 	sc := flagsToStatementContext(dagReq.Flags)
-	sc.TimeZone = time.FixedZone("UTC", int(dagReq.TimeZoneOffset))
+	sc.TimeZone, err = constructTimeZone(dagReq.TimeZoneName, int(dagReq.TimeZoneOffset))
+	if err != nil {
+		return nil, nil, nil, errors.Trace(err)
+	}
+
 	ctx := &dagContext{
 		dagReq:    dagReq,
 		keyRanges: req.Ranges,
@@ -113,16 +164,28 @@ func (h *rpcHandler) buildDAGExecutor(req *coprocessor.Request) (*dagContext, ex
 	return ctx, e, dagReq, err
 }
 
+// constructTimeZone constructs timezone by name first. When the timezone name
+// is set, the daylight saving problem must be considered. Otherwise the
+// timezone offset in seconds east of UTC is used to constructed the timezone.
+func constructTimeZone(name string, offset int) (*time.Location, error) {
+	if name != "" {
+		return LocCache.getLoc(name)
+	} else {
+		return time.FixedZone("", offset), nil
+	}
+}
+
 func (h *rpcHandler) handleCopStream(ctx context.Context, req *coprocessor.Request) (tikvpb.Tikv_CoprocessorStreamClient, error) {
-	_, e, dagReq, err := h.buildDAGExecutor(req)
+	dagCtx, e, dagReq, err := h.buildDAGExecutor(req)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
 
 	return &mockCopStreamClient{
-		exec: e,
-		req:  dagReq,
-		ctx:  ctx,
+		exec:   e,
+		req:    dagReq,
+		ctx:    ctx,
+		dagCtx: dagCtx,
 	}, nil
 }
 
@@ -383,26 +446,12 @@ func (e *evalContext) decodeRelatedColumnVals(relatedColOffsets []int, value [][
 	return nil
 }
 
-// Flags are used by tipb.SelectRequest.Flags to handle execution mode, like how to handle truncate error.
-const (
-	// FlagIgnoreTruncate indicates if truncate error should be ignored.
-	// Read-only statements should ignore truncate error, write statements should not ignore truncate error.
-	FlagIgnoreTruncate uint64 = 1
-	// FlagTruncateAsWarning indicates if truncate error should be returned as warning.
-	// This flag only matters if FlagIgnoreTruncate is not set, in strict sql mode, truncate error should
-	// be returned as error, in non-strict sql mode, truncate error should be saved as warning.
-	FlagTruncateAsWarning uint64 = 1 << 1
-
-	// FlagPadCharToFullLength indicates if sql_mode 'PAD_CHAR_TO_FULL_LENGTH' is set.
-	FlagPadCharToFullLength uint64 = 1 << 2
-)
-
 // flagsToStatementContext creates a StatementContext from a `tipb.SelectRequest.Flags`.
 func flagsToStatementContext(flags uint64) *stmtctx.StatementContext {
 	sc := new(stmtctx.StatementContext)
-	sc.IgnoreTruncate = (flags & FlagIgnoreTruncate) > 0
-	sc.TruncateAsWarning = (flags & FlagTruncateAsWarning) > 0
-	sc.PadCharToFullLength = (flags & FlagPadCharToFullLength) > 0
+	sc.IgnoreTruncate = (flags & model.FlagIgnoreTruncate) > 0
+	sc.TruncateAsWarning = (flags & model.FlagTruncateAsWarning) > 0
+	sc.PadCharToFullLength = (flags & model.FlagPadCharToFullLength) > 0
 	return sc
 }
 
@@ -427,6 +476,7 @@ type mockCopStreamClient struct {
 	req      *tipb.DAGRequest
 	exec     executor
 	ctx      context.Context
+	dagCtx   *dagContext
 	finished bool
 }
 
@@ -459,7 +509,7 @@ func (mock *mockCopStreamClient) Recv() (*coprocessor.Response, error) {
 
 	var resp coprocessor.Response
 	counts := make([]int64, len(mock.req.Executors))
-	chunk, finish, ran, counts, err := mock.readBlockFromExecutor()
+	chunk, finish, ran, counts, warnings, err := mock.readBlockFromExecutor()
 	resp.Range = ran
 	if err != nil {
 		if locked, ok := errors.Cause(err).(*ErrLocked); ok {
@@ -484,10 +534,17 @@ func (mock *mockCopStreamClient) Recv() (*coprocessor.Response, error) {
 		resp.OtherError = err.Error()
 		return &resp, nil
 	}
+	var Warnings []*tipb.Error
+	if len(warnings) > 0 {
+		Warnings = make([]*tipb.Error, 0, len(warnings))
+		for i := range warnings {
+			Warnings = append(Warnings, toPBError(warnings[i].Err))
+		}
+	}
 	streamResponse := tipb.StreamResponse{
-		Error:      toPBError(err),
-		EncodeType: tipb.EncodeType_TypeDefault,
-		Data:       data,
+		Error:    toPBError(err),
+		Data:     data,
+		Warnings: Warnings,
 	}
 	// The counts was the output count of each executor, but now it is the scan count of each range,
 	// so we need a flag to tell them apart.
@@ -503,7 +560,7 @@ func (mock *mockCopStreamClient) Recv() (*coprocessor.Response, error) {
 	return &resp, nil
 }
 
-func (mock *mockCopStreamClient) readBlockFromExecutor() (tipb.Chunk, bool, *coprocessor.KeyRange, []int64, error) {
+func (mock *mockCopStreamClient) readBlockFromExecutor() (tipb.Chunk, bool, *coprocessor.KeyRange, []int64, []stmtctx.SQLWarn, error) {
 	var chunk tipb.Chunk
 	var ran coprocessor.KeyRange
 	var finish bool
@@ -514,7 +571,7 @@ func (mock *mockCopStreamClient) readBlockFromExecutor() (tipb.Chunk, bool, *cop
 		row, err := mock.exec.Next(mock.ctx)
 		if err != nil {
 			ran.End, _ = mock.exec.Cursor()
-			return chunk, false, &ran, nil, errors.Trace(err)
+			return chunk, false, &ran, nil, nil, errors.Trace(err)
 		}
 		if row == nil {
 			finish = true
@@ -529,10 +586,12 @@ func (mock *mockCopStreamClient) readBlockFromExecutor() (tipb.Chunk, bool, *cop
 	if desc {
 		ran.Start, ran.End = ran.End, ran.Start
 	}
-	return chunk, finish, &ran, mock.exec.Counts(), nil
+	warnings := mock.dagCtx.evalCtx.sc.GetWarnings()
+	mock.dagCtx.evalCtx.sc.SetWarnings(nil)
+	return chunk, finish, &ran, mock.exec.Counts(), warnings, nil
 }
 
-func buildResp(chunks []tipb.Chunk, counts []int64, err error, warnings []error) *coprocessor.Response {
+func buildResp(chunks []tipb.Chunk, counts []int64, err error, warnings []stmtctx.SQLWarn) *coprocessor.Response {
 	resp := &coprocessor.Response{}
 	selResp := &tipb.SelectResponse{
 		Error:        toPBError(err),
@@ -542,7 +601,7 @@ func buildResp(chunks []tipb.Chunk, counts []int64, err error, warnings []error)
 	if len(warnings) > 0 {
 		selResp.Warnings = make([]*tipb.Error, 0, len(warnings))
 		for i := range warnings {
-			selResp.Warnings = append(selResp.Warnings, toPBError(warnings[i]))
+			selResp.Warnings = append(selResp.Warnings, toPBError(warnings[i].Err))
 		}
 	}
 	if err != nil {

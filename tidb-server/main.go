@@ -44,7 +44,6 @@ import (
 	"github.com/pingcap/tidb/store/tikv/gcworker"
 	"github.com/pingcap/tidb/terror"
 	"github.com/pingcap/tidb/util"
-	"github.com/pingcap/tidb/util/kvcache"
 	"github.com/pingcap/tidb/util/logutil"
 	"github.com/pingcap/tidb/util/printer"
 	"github.com/pingcap/tidb/util/systimemon"
@@ -58,24 +57,25 @@ import (
 
 // Flag Names
 const (
-	nmVersion         = "V"
-	nmConfig          = "config"
-	nmStore           = "store"
-	nmStorePath       = "path"
-	nmHost            = "host"
-	nmPort            = "P"
-	nmSocket          = "socket"
-	nmBinlogSocket    = "binlog-socket"
-	nmRunDDL          = "run-ddl"
-	nmLogLevel        = "L"
-	nmLogFile         = "log-file"
-	nmLogSlowQuery    = "log-slow-query"
-	nmReportStatus    = "report-status"
-	nmStatusPort      = "status"
-	nmMetricsAddr     = "metrics-addr"
-	nmMetricsInterval = "metrics-interval"
-	nmDdlLease        = "lease"
-	nmTokenLimit      = "token-limit"
+	nmVersion          = "V"
+	nmConfig           = "config"
+	nmStore            = "store"
+	nmStorePath        = "path"
+	nmHost             = "host"
+	nmAdvertiseAddress = "advertise-address"
+	nmPort             = "P"
+	nmSocket           = "socket"
+	nmBinlogSocket     = "binlog-socket"
+	nmRunDDL           = "run-ddl"
+	nmLogLevel         = "L"
+	nmLogFile          = "log-file"
+	nmLogSlowQuery     = "log-slow-query"
+	nmReportStatus     = "report-status"
+	nmStatusPort       = "status"
+	nmMetricsAddr      = "metrics-addr"
+	nmMetricsInterval  = "metrics-interval"
+	nmDdlLease         = "lease"
+	nmTokenLimit       = "token-limit"
 
 	nmProxyProtocolNetworks      = "proxy-protocol-networks"
 	nmProxyProtocolHeaderTimeout = "proxy-protocol-header-timeout"
@@ -86,15 +86,16 @@ var (
 	configPath = flag.String(nmConfig, "", "config file path")
 
 	// Base
-	store        = flag.String(nmStore, "mocktikv", "registered store name, [tikv, mocktikv]")
-	storePath    = flag.String(nmStorePath, "/tmp/tidb", "tidb storage path")
-	host         = flag.String(nmHost, "0.0.0.0", "tidb server host")
-	port         = flag.String(nmPort, "4000", "tidb server port")
-	socket       = flag.String(nmSocket, "", "The socket file to use for connection.")
-	binlogSocket = flag.String(nmBinlogSocket, "", "socket file to write binlog")
-	runDDL       = flagBoolean(nmRunDDL, true, "run ddl worker on this tidb-server")
-	ddlLease     = flag.String(nmDdlLease, "45s", "schema lease duration, very dangerous to change only if you know what you do")
-	tokenLimit   = flag.Int(nmTokenLimit, 1000, "the limit of concurrent executed sessions")
+	store            = flag.String(nmStore, "mocktikv", "registered store name, [tikv, mocktikv]")
+	storePath        = flag.String(nmStorePath, "/tmp/tidb", "tidb storage path")
+	host             = flag.String(nmHost, "0.0.0.0", "tidb server host")
+	advertiseAddress = flag.String(nmAdvertiseAddress, "", "tidb server advertise IP")
+	port             = flag.String(nmPort, "4000", "tidb server port")
+	socket           = flag.String(nmSocket, "", "The socket file to use for connection.")
+	binlogSocket     = flag.String(nmBinlogSocket, "", "socket file to write binlog")
+	runDDL           = flagBoolean(nmRunDDL, true, "run ddl worker on this tidb-server")
+	ddlLease         = flag.String(nmDdlLease, "45s", "schema lease duration, very dangerous to change only if you know what you do")
+	tokenLimit       = flag.Int(nmTokenLimit, 1000, "the limit of concurrent executed sessions")
 
 	// Log
 	logLevel     = flag.String(nmLogLevel, "info", "log level: info, debug, warn, error, fatal")
@@ -137,10 +138,10 @@ func main() {
 	setupTracing() // Should before createServer and after setup config.
 	printInfo()
 	setupBinlogClient()
+	setupMetrics()
 	createStoreAndDomain()
 	createServer()
 	setupSignalHandler()
-	setupMetrics()
 	runServer()
 	cleanup()
 	os.Exit(0)
@@ -165,22 +166,26 @@ func createStoreAndDomain() {
 }
 
 func setupBinlogClient() {
-	if cfg.BinlogSocket == "" {
+	if cfg.Binlog.BinlogSocket == "" {
 		return
 	}
 	dialerOpt := grpc.WithDialer(func(addr string, timeout time.Duration) (net.Conn, error) {
 		return net.DialTimeout("unix", addr, timeout)
 	})
-	clientConn, err := session.DialPumpClientWithRetry(cfg.BinlogSocket, util.DefaultMaxRetries, dialerOpt)
+	clientConn, err := session.DialPumpClientWithRetry(cfg.Binlog.BinlogSocket, util.DefaultMaxRetries, dialerOpt)
 	terror.MustNil(err)
+	if cfg.Binlog.IgnoreError {
+		binloginfo.SetIgnoreError(true)
+	}
+	binloginfo.SetGRPCTimeout(parseDuration(cfg.Binlog.WriteTimeout))
 	binloginfo.SetPumpClient(binlog.NewPumpClient(clientConn))
-	log.Infof("created binlog client at %s", cfg.BinlogSocket)
+	log.Infof("created binlog client at %s, ignore error %v", cfg.Binlog.BinlogSocket, cfg.Binlog.IgnoreError)
 }
 
 // Prometheus push.
 const zeroDuration = time.Duration(0)
 
-// pushMetric pushs metircs in background.
+// pushMetric pushes metrics in background.
 func pushMetric(addr string, interval time.Duration) {
 	if interval == zeroDuration || len(addr) == 0 {
 		log.Info("disable Prometheus push client")
@@ -190,7 +195,7 @@ func pushMetric(addr string, interval time.Duration) {
 	go prometheusPushClient(addr, interval)
 }
 
-// prometheusPushClient pushs metrics to Prometheus Pushgateway.
+// prometheusPushClient pushes metrics to Prometheus Pushgateway.
 func prometheusPushClient(addr string, interval time.Duration) {
 	// TODO: TiDB do not have uniq name, so we use host+port to compose a name.
 	job := "tidb"
@@ -259,6 +264,9 @@ func overrideConfig() {
 	if actualFlags[nmHost] {
 		cfg.Host = *host
 	}
+	if actualFlags[nmAdvertiseAddress] {
+		cfg.AdvertiseAddress = *advertiseAddress
+	}
 	var err error
 	if actualFlags[nmPort] {
 		var p int
@@ -276,7 +284,7 @@ func overrideConfig() {
 		cfg.Socket = *socket
 	}
 	if actualFlags[nmBinlogSocket] {
-		cfg.BinlogSocket = *binlogSocket
+		cfg.Binlog.BinlogSocket = *binlogSocket
 	}
 	if actualFlags[nmRunDDL] {
 		cfg.RunDDL = *runDDL
@@ -325,8 +333,6 @@ func overrideConfig() {
 	}
 }
 
-const minAutoAnalyzeRatio = 0.3
-
 func validateConfig() {
 	if cfg.Security.SkipGrantTable && !hasRootPrivilege() {
 		log.Error("TiDB run with skip-grant-table need root privilege.")
@@ -340,6 +346,10 @@ func validateConfig() {
 			}
 		}
 		log.Errorf("\"store\" should be in [%s] only", strings.Join(nameList, ", "))
+		os.Exit(-1)
+	}
+	if cfg.Store == "mocktikv" && cfg.RunDDL == false {
+		log.Errorf("can't disable DDL on mocktikv")
 		os.Exit(-1)
 	}
 	if cfg.Log.File.MaxSize > config.MaxLogFileSize {
@@ -357,9 +367,6 @@ func validateConfig() {
 		log.Errorf("lower-case-table-names should be 0 or 1 or 2.")
 		os.Exit(-1)
 	}
-	if cfg.Performance.AutoAnalyzeRatio > 0 && cfg.Performance.AutoAnalyzeRatio < minAutoAnalyzeRatio {
-		cfg.Performance.AutoAnalyzeRatio = minAutoAnalyzeRatio
-	}
 }
 
 func setGlobalVars() {
@@ -371,26 +378,22 @@ func setGlobalVars() {
 	domain.RunAutoAnalyze = cfg.Performance.RunAutoAnalyze
 	statistics.FeedbackProbability = cfg.Performance.FeedbackProbability
 	statistics.MaxQueryFeedbackCount = int(cfg.Performance.QueryFeedbackLimit)
-	statistics.AutoAnalyzeRatio = cfg.Performance.AutoAnalyzeRatio
-	plan.RatioOfPseudoEstimate = cfg.Performance.PseudoEstimateRatio
+	statistics.RatioOfPseudoEstimate = cfg.Performance.PseudoEstimateRatio
 	ddl.RunWorker = cfg.RunDDL
 	ddl.EnableSplitTableRegion = cfg.SplitTable
-	session.SetCommitRetryLimit(cfg.Performance.RetryLimit)
 	plan.AllowCartesianProduct = cfg.Performance.CrossJoin
 	privileges.SkipWithGrant = cfg.Security.SkipGrantTable
 
-	if cfg.PlanCache.Enabled {
-		plan.GlobalPlanCache = kvcache.NewShardedLRUCache(cfg.PlanCache.Capacity, cfg.PlanCache.Shards)
-	}
-
-	plan.PreparedPlanCacheEnabled = cfg.PreparedPlanCache.Enabled
-	if plan.PreparedPlanCacheEnabled {
+	plan.SetPreparedPlanCache(cfg.PreparedPlanCache.Enabled)
+	if plan.PreparedPlanCacheEnabled() {
 		plan.PreparedPlanCacheCapacity = cfg.PreparedPlanCache.Capacity
 	}
 
 	if cfg.TiKVClient.GrpcConnectionCount > 0 {
 		tikv.MaxConnectionCount = cfg.TiKVClient.GrpcConnectionCount
 	}
+	tikv.GrpcKeepAliveTime = time.Duration(cfg.TiKVClient.GrpcKeepAliveTime) * time.Second
+	tikv.GrpcKeepAliveTimeout = time.Duration(cfg.TiKVClient.GrpcKeepAliveTimeout) * time.Second
 
 	// set lower_case_table_names
 	variable.SysVars["lower_case_table_names"].Value = strconv.Itoa(cfg.LowerCaseTableNames)
@@ -416,7 +419,8 @@ func createServer() {
 	driver = server.NewTiDBDriver(storage)
 	var err error
 	svr, err = server.NewServer(cfg, driver)
-	terror.MustNil(err)
+	// Both domain and storage have started, so we have to clean them before exiting.
+	terror.MustNil(err, closeDomainAndStorage)
 	if cfg.XProtocol.XServer {
 		xcfg := &xserver.Config{
 			Addr:       fmt.Sprintf("%s:%d", cfg.XProtocol.XHost, cfg.XProtocol.XPort),
@@ -424,7 +428,7 @@ func createServer() {
 			TokenLimit: cfg.TokenLimit,
 		}
 		xsvr, err = xserver.NewServer(xcfg)
-		terror.MustNil(err)
+		terror.MustNil(err, closeDomainAndStorage)
 	}
 }
 
@@ -439,7 +443,7 @@ func setupSignalHandler() {
 	go func() {
 		sig := <-sc
 		log.Infof("Got signal [%s] to exit.", sig)
-		if sig == syscall.SIGTERM {
+		if sig == syscall.SIGQUIT {
 			graceful = true
 		}
 
@@ -486,11 +490,15 @@ func runServer() {
 	}
 }
 
+func closeDomainAndStorage() {
+	dom.Close()
+	err := storage.Close()
+	terror.Log(errors.Trace(err))
+}
+
 func cleanup() {
 	if graceful {
 		svr.GracefulDown()
 	}
-	dom.Close()
-	err := storage.Close()
-	terror.Log(errors.Trace(err))
+	closeDomainAndStorage()
 }

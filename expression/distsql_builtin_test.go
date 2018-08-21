@@ -20,20 +20,33 @@ import (
 	"github.com/pingcap/tidb/mysql"
 	"github.com/pingcap/tidb/sessionctx/stmtctx"
 	"github.com/pingcap/tidb/types"
+	"github.com/pingcap/tidb/util/chunk"
 	"github.com/pingcap/tidb/util/codec"
-	tipb "github.com/pingcap/tipb/go-tipb"
+	"github.com/pingcap/tipb/go-tipb"
+	log "github.com/sirupsen/logrus"
 )
 
 var _ = Suite(&testEvalSuite{})
 
-type testEvalSuite struct{}
+type testEvalSuite struct {
+	colID int
+}
+
+func (s *testEvalSuite) SetUpSuite(c *C) {
+	s.colID = 0
+}
+
+func (s *testEvalSuite) allocColID() int {
+	s.colID++
+	return s.colID
+}
 
 // TestEval test expr.Eval().
 // TODO: add more tests.
 func (s *testEvalSuite) TestEval(c *C) {
-	row := types.DatumRow{types.NewDatum(100)}
+	row := chunk.MutRowFromDatums([]types.Datum{types.NewDatum(100)}).ToRow()
 	fieldTps := make([]*types.FieldType, 1)
-	fieldTps[0] = types.NewFieldType(mysql.TypeDouble)
+	fieldTps[0] = types.NewFieldType(mysql.TypeLonglong)
 	tests := []struct {
 		expr   *tipb.Expr
 		result types.Datum
@@ -134,7 +147,11 @@ func datumExpr(d types.Datum) *tipb.Expr {
 		expr.Val = codec.EncodeInt(nil, int64(d.GetMysqlDuration().Duration))
 	case types.KindMysqlDecimal:
 		expr.Tp = tipb.ExprType_MysqlDecimal
-		expr.Val = codec.EncodeDecimal(nil, d.GetMysqlDecimal(), d.Length(), d.Frac())
+		var err error
+		expr.Val, err = codec.EncodeDecimal(nil, d.GetMysqlDecimal(), d.Length(), d.Frac())
+		if err != nil {
+			log.Warnf("err happened when EncodeDecimal in datumExpr:%s", err.Error())
+		}
 	default:
 		expr.Tp = tipb.ExprType_Null
 	}

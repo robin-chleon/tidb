@@ -15,11 +15,12 @@ package plan
 
 import (
 	. "github.com/pingcap/check"
+	"github.com/pingcap/tidb/expression"
 	"github.com/pingcap/tidb/model"
 	"github.com/pingcap/tidb/mysql"
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util/testleak"
-	tipb "github.com/pingcap/tipb/go-tipb"
+	"github.com/pingcap/tipb/go-tipb"
 )
 
 var _ = Suite(&testDistsqlSuite{})
@@ -35,16 +36,16 @@ func (s *testDistsqlSuite) TestColumnToProto(c *C) {
 	col := &model.ColumnInfo{
 		FieldType: *tp,
 	}
-	pc := columnToProto(col)
+	pc := model.ColumnToProto(col)
 	expect := &tipb.ColumnInfo{ColumnId: 0, Tp: 3, Collation: 83, ColumnLen: -1, Decimal: -1, Flag: 10, Elems: []string(nil), DefaultVal: []uint8(nil), PkHandle: false, XXX_unrecognized: []uint8(nil)}
 	c.Assert(pc, DeepEquals, expect)
 
 	cols := []*model.ColumnInfo{col, col}
-	pcs := ColumnsToProto(cols, false)
+	pcs := model.ColumnsToProto(cols, false)
 	for _, v := range pcs {
 		c.Assert(v.GetFlag(), Equals, int32(10))
 	}
-	pcs = ColumnsToProto(cols, true)
+	pcs = model.ColumnsToProto(cols, true)
 	for _, v := range pcs {
 		c.Assert(v.GetFlag(), Equals, int32(10))
 	}
@@ -56,7 +57,7 @@ func (s *testDistsqlSuite) TestColumnToProto(c *C) {
 	col = &model.ColumnInfo{
 		FieldType: *tp,
 	}
-	pc = columnToProto(col)
+	pc = model.ColumnToProto(col)
 	c.Assert(pc.Collation, Equals, int32(mysql.DefaultCollationID))
 }
 
@@ -116,8 +117,47 @@ func (s *testDistsqlSuite) TestIndexToProto(c *C) {
 		PKIsHandle: true,
 	}
 
-	pIdx := IndexToProto(&tbInfo, idxInfos[0])
+	pIdx := model.IndexToProto(&tbInfo, idxInfos[0])
 	c.Assert(pIdx.TableId, Equals, int64(1))
 	c.Assert(pIdx.IndexId, Equals, int64(1))
 	c.Assert(pIdx.Unique, Equals, true)
+}
+
+func (s *testDistsqlSuite) TestIndexScanToProto(c *C) {
+	tp := types.NewFieldType(mysql.TypeLong)
+	tp.Flag = 10
+	tp.Collate = "utf8_bin"
+
+	name := model.NewCIStr("a")
+	col := &model.ColumnInfo{
+		ID:        1,
+		Name:      name,
+		State:     model.StatePublic,
+		FieldType: *tp,
+	}
+	idxInfo := &model.IndexInfo{
+		ID:    2,
+		Name:  name,
+		State: model.StatePublic,
+		Columns: []*model.IndexColumn{
+			{Length: types.UnspecifiedLength},
+		},
+	}
+	p := new(PhysicalIndexScan)
+	p.Table = &model.TableInfo{
+		ID:      1,
+		Columns: []*model.ColumnInfo{col},
+		Indices: []*model.IndexInfo{idxInfo},
+	}
+	p.Index = idxInfo
+	p.schema = expression.NewSchema(&expression.Column{
+		ID: model.ExtraHandleID,
+	})
+	pbExec, err := p.ToPB(nil)
+	c.Assert(err, IsNil)
+	idxScan := pbExec.IdxScan
+	pbColumn := idxScan.Columns[0]
+	c.Assert(pbColumn.Tp, Equals, int32(mysql.TypeLonglong))
+	c.Assert(pbColumn.ColumnId, Equals, int64(model.ExtraHandleID))
+	c.Assert(pbColumn.PkHandle, Equals, true)
 }

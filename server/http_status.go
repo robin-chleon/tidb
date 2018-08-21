@@ -17,7 +17,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"sync"
+	"net/http/pprof"
 
 	"github.com/gorilla/mux"
 	"github.com/juju/errors"
@@ -28,14 +28,10 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-var once sync.Once
-
 const defaultStatusAddr = ":10080"
 
 func (s *Server) startStatusHTTP() {
-	once.Do(func() {
-		go s.startHTTPServer()
-	})
+	go s.startHTTPServer()
 }
 
 func (s *Server) startHTTPServer() {
@@ -48,6 +44,7 @@ func (s *Server) startHTTPServer() {
 	router.Handle("/stats/dump/{db}/{table}", s.newStatsHandler())
 
 	router.Handle("/settings", settingsHandler{})
+	router.Handle("/binlog/recover", binlogRecover{})
 
 	tikvHandlerTool := s.newTikvHandlerTool()
 	router.Handle("/schema", schemaHandler{tikvHandlerTool})
@@ -55,15 +52,20 @@ func (s *Server) startHTTPServer() {
 	router.Handle("/schema/{db}/{table}", schemaHandler{tikvHandlerTool})
 	router.Handle("/tables/{colID}/{colTp}/{colFlag}/{colLen}", valueHandler{})
 	router.Handle("/ddl/history", ddlHistoryJobHandler{tikvHandlerTool})
+
+	// HTTP path for get server info.
+	router.Handle("/info", serverInfoHandler{tikvHandlerTool})
+	router.Handle("/info/all", allServerInfoHandler{tikvHandlerTool})
 	if s.cfg.Store == "tikv" {
-		// HTTP path for tikv
+		// HTTP path for tikv.
 		router.Handle("/tables/{db}/{table}/regions", tableHandler{tikvHandlerTool, opTableRegions})
+		router.Handle("/tables/{db}/{table}/scatter", tableHandler{tikvHandlerTool, opTableScatter})
+		router.Handle("/tables/{db}/{table}/stop-scatter", tableHandler{tikvHandlerTool, opStopTableScatter})
 		router.Handle("/tables/{db}/{table}/disk-usage", tableHandler{tikvHandlerTool, opTableDiskUsage})
 		router.Handle("/regions/meta", regionHandler{tikvHandlerTool})
 		router.Handle("/regions/{regionID}", regionHandler{tikvHandlerTool})
 		router.Handle("/mvcc/key/{db}/{table}/{handle}", mvccTxnHandler{tikvHandlerTool, opMvccGetByKey})
 		router.Handle("/mvcc/txn/{startTS}/{db}/{table}", mvccTxnHandler{tikvHandlerTool, opMvccGetByTxn})
-		router.Handle("/mvcc/txn/{startTS}", mvccTxnHandler{tikvHandlerTool, opMvccGetByTxn})
 		router.Handle("/mvcc/hex/{hexKey}", mvccTxnHandler{tikvHandlerTool, opMvccGetByHex})
 		router.Handle("/mvcc/index/{db}/{table}/{index}/{handle}", mvccTxnHandler{tikvHandlerTool, opMvccGetByIdx})
 	}
@@ -71,18 +73,27 @@ func (s *Server) startHTTPServer() {
 	if s.cfg.Status.StatusPort == 0 {
 		addr = defaultStatusAddr
 	}
-	log.Infof("Listening on %v for status and metrics report.", addr)
-	http.Handle("/", router)
 
+	serverMux := http.NewServeMux()
+	serverMux.Handle("/", router)
+
+	serverMux.HandleFunc("/debug/pprof/", pprof.Index)
+	serverMux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+	serverMux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+	serverMux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+	serverMux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+
+	log.Infof("Listening on %v for status and metrics report.", addr)
+	s.statusServer = &http.Server{Addr: addr, Handler: serverMux}
 	var err error
 	if len(s.cfg.Security.ClusterSSLCA) != 0 {
-		err = http.ListenAndServeTLS(addr, s.cfg.Security.ClusterSSLCert, s.cfg.Security.ClusterSSLKey, nil)
+		err = s.statusServer.ListenAndServeTLS(s.cfg.Security.ClusterSSLCert, s.cfg.Security.ClusterSSLKey)
 	} else {
-		err = http.ListenAndServe(addr, nil)
+		err = s.statusServer.ListenAndServe()
 	}
 
 	if err != nil {
-		log.Fatal(err)
+		log.Info(err)
 	}
 }
 

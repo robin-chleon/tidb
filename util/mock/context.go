@@ -17,9 +17,11 @@ package mock
 import (
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/juju/errors"
 	"github.com/pingcap/tidb/kv"
+	"github.com/pingcap/tidb/owner"
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/sessionctx/variable"
 	"github.com/pingcap/tidb/types"
@@ -42,6 +44,11 @@ type Context struct {
 	cancel      context.CancelFunc
 	sm          util.SessionManager
 	pcache      *kvcache.SimpleLRUCache
+}
+
+// DDLOwnerChecker returns owner.DDLOwnerChecker.
+func (c *Context) DDLOwnerChecker() owner.DDLOwnerChecker {
+	return nil
 }
 
 // SetValue implements sessionctx.Context SetValue interface.
@@ -149,7 +156,7 @@ func (c *Context) InitTxnWithStartTS(startTS uint64) error {
 	}
 	if c.Store != nil {
 		membufCap := kv.DefaultTxnMembufCap
-		if c.sessionVars.ImportingData {
+		if c.sessionVars.LightningMode {
 			membufCap = kv.ImportingTxnMembufCap
 		}
 		txn, err := c.Store.BeginWithStartTS(startTS)
@@ -217,6 +224,8 @@ func NewContext() *Context {
 		cancel:      cancel,
 	}
 	sctx.sessionVars.MaxChunkSize = 2
+	sctx.sessionVars.StmtCtx.TimeZone = time.UTC
+	sctx.sessionVars.GlobalVarsAccessor = variable.NewMockGlobalAccessor()
 	return sctx
 }
 

@@ -17,7 +17,6 @@ import (
 	"math"
 
 	"github.com/juju/errors"
-	"github.com/pingcap/tidb/ast"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/mysql"
 	"github.com/pingcap/tidb/sessionctx/stmtctx"
@@ -27,7 +26,7 @@ import (
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util/codec"
 	"github.com/pingcap/tidb/util/ranger"
-	tipb "github.com/pingcap/tipb/go-tipb"
+	"github.com/pingcap/tipb/go-tipb"
 )
 
 // RequestBuilder is used to build a "kv.Request".
@@ -69,7 +68,7 @@ func (builder *RequestBuilder) SetTableHandles(tid int64, handles []int64) *Requ
 	return builder
 }
 
-// SetDAGRequest sets the request type to "ReqTypeDAG" and cosntruct request data.
+// SetDAGRequest sets the request type to "ReqTypeDAG" and construct request data.
 func (builder *RequestBuilder) SetDAGRequest(dag *tipb.DAGRequest) *RequestBuilder {
 	if builder.err != nil {
 		return builder
@@ -125,15 +124,9 @@ func (builder *RequestBuilder) SetKeepOrder(order bool) *RequestBuilder {
 	return builder
 }
 
-func (builder *RequestBuilder) getIsolationLevel(sv *variable.SessionVars) kv.IsoLevel {
-	var isoLevel string
-	if sv.TxnIsolationLevelOneShot.State == 2 {
-		isoLevel = sv.TxnIsolationLevelOneShot.Value
-	}
-	if isoLevel == "" {
-		isoLevel, _ = sv.GetSystemVar(variable.TxnIsolation)
-	}
-	if isoLevel == ast.ReadCommitted {
+func (builder *RequestBuilder) getIsolationLevel() kv.IsoLevel {
+	switch builder.Tp {
+	case kv.ReqTypeAnalyze:
 		return kv.RC
 	}
 	return kv.SI
@@ -155,7 +148,7 @@ func (builder *RequestBuilder) getKVPriority(sv *variable.SessionVars) int {
 // "Concurrency", "IsolationLevel", "NotFillCache".
 func (builder *RequestBuilder) SetFromSessionVars(sv *variable.SessionVars) *RequestBuilder {
 	builder.Request.Concurrency = sv.DistSQLScanConcurrency
-	builder.Request.IsolationLevel = builder.getIsolationLevel(sv)
+	builder.Request.IsolationLevel = builder.getIsolationLevel()
 	builder.Request.NotFillCache = sv.StmtCtx.NotFillCache
 	builder.Request.Priority = builder.getKVPriority(sv)
 	return builder
@@ -180,18 +173,28 @@ func TableRangesToKVRanges(tid int64, ranges []*ranger.Range, fb *statistics.Que
 	}
 	ranges = fb.Hist().SplitRange(ranges)
 	krs := make([]kv.KeyRange, 0, len(ranges))
-	newRanges := make([]*ranger.Range, 0, len(ranges))
+	feedbackRanges := make([]*ranger.Range, 0, len(ranges))
 	for _, ran := range ranges {
-		low, high := encodeHandleKey(ran)
+		low := codec.EncodeInt(nil, ran.LowVal[0].GetInt64())
+		high := codec.EncodeInt(nil, ran.HighVal[0].GetInt64())
+		if ran.LowExclude {
+			low = []byte(kv.Key(low).PrefixNext())
+		}
+		// If this range is split by histogram, then the high val will equal to one bucket's upper bound,
+		// since we need to guarantee each range falls inside the exactly one bucket, `PerfixNext` will make the
+		// high value greater than upper bound, so we store the range here.
+		r := &ranger.Range{LowVal: []types.Datum{types.NewBytesDatum(low)},
+			HighVal: []types.Datum{types.NewBytesDatum(high)}}
+		feedbackRanges = append(feedbackRanges, r)
+
+		if !ran.HighExclude {
+			high = []byte(kv.Key(high).PrefixNext())
+		}
 		startKey := tablecodec.EncodeRowKey(tid, low)
 		endKey := tablecodec.EncodeRowKey(tid, high)
 		krs = append(krs, kv.KeyRange{StartKey: startKey, EndKey: endKey})
-
-		r := &ranger.Range{LowVal: []types.Datum{types.NewBytesDatum(low)},
-			HighVal: []types.Datum{types.NewBytesDatum(high)}}
-		newRanges = append(newRanges, r)
 	}
-	fb.StoreRanges(newRanges)
+	fb.StoreRanges(feedbackRanges)
 	return krs
 }
 
@@ -246,29 +249,35 @@ func IndexRangesToKVRanges(sc *stmtctx.StatementContext, tid, idxID int64, range
 	if fb == nil || fb.Hist() == nil {
 		return indexRangesToKVWithoutSplit(sc, tid, idxID, ranges)
 	}
-	newRanges := make([]*ranger.Range, 0, len(ranges))
+	feedbackRanges := make([]*ranger.Range, 0, len(ranges))
 	for _, ran := range ranges {
 		low, high, err := encodeIndexKey(sc, ran)
 		if err != nil {
 			return nil, errors.Trace(err)
 		}
-		newRanges = append(newRanges, &ranger.Range{LowVal: []types.Datum{types.NewBytesDatum(low)},
+		feedbackRanges = append(feedbackRanges, &ranger.Range{LowVal: []types.Datum{types.NewBytesDatum(low)},
 			HighVal: []types.Datum{types.NewBytesDatum(high)}, LowExclude: false, HighExclude: true})
 	}
-	ranges = fb.Hist().SplitRange(newRanges)
-	krs := make([]kv.KeyRange, 0, len(ranges))
-	for _, ran := range ranges {
+	feedbackRanges = fb.Hist().SplitRange(feedbackRanges)
+	krs := make([]kv.KeyRange, 0, len(feedbackRanges))
+	for _, ran := range feedbackRanges {
+		low, high := ran.LowVal[0].GetBytes(), ran.HighVal[0].GetBytes()
 		if ran.LowExclude {
-			ran.LowVal[0].SetBytes(kv.Key(ran.LowVal[0].GetBytes()).PrefixNext())
+			low = kv.Key(low).PrefixNext()
 		}
+		ran.LowVal[0].SetBytes(low)
+		// If this range is split by histogram, then the high val will equal to one bucket's upper bound,
+		// since we need to guarantee each range falls inside the exactly one bucket, `PerfixNext` will make the
+		// high value greater than upper bound, so we store the high value here.
+		ran.HighVal[0].SetBytes(high)
 		if !ran.HighExclude {
-			ran.HighVal[0].SetBytes(kv.Key(ran.HighVal[0].GetBytes()).PrefixNext())
+			high = kv.Key(high).PrefixNext()
 		}
-		startKey := tablecodec.EncodeIndexSeekKey(tid, idxID, ran.LowVal[0].GetBytes())
-		endKey := tablecodec.EncodeIndexSeekKey(tid, idxID, ran.HighVal[0].GetBytes())
+		startKey := tablecodec.EncodeIndexSeekKey(tid, idxID, low)
+		endKey := tablecodec.EncodeIndexSeekKey(tid, idxID, high)
 		krs = append(krs, kv.KeyRange{StartKey: startKey, EndKey: endKey})
 	}
-	fb.StoreRanges(ranges)
+	fb.StoreRanges(feedbackRanges)
 	return krs, nil
 }
 
@@ -298,8 +307,22 @@ func encodeIndexKey(sc *stmtctx.StatementContext, ran *ranger.Range) ([]byte, []
 	if err != nil {
 		return nil, nil, errors.Trace(err)
 	}
+
 	if !ran.HighExclude {
 		high = []byte(kv.Key(high).PrefixNext())
+	}
+
+	var hasNull bool
+	for _, highVal := range ran.HighVal {
+		if highVal.IsNull() {
+			hasNull = true
+			break
+		}
+	}
+
+	if hasNull {
+		// Append 0 to make unique-key range [null, null] to be a scan rather than point-get.
+		high = []byte(kv.Key(high).Next())
 	}
 	return low, high, nil
 }

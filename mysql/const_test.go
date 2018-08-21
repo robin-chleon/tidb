@@ -18,6 +18,7 @@ import (
 	"testing"
 
 	. "github.com/pingcap/check"
+	"github.com/pingcap/tidb/domain"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/mysql"
 	"github.com/pingcap/tidb/parser"
@@ -40,6 +41,7 @@ type testMySQLConstSuite struct {
 	cluster   *mocktikv.Cluster
 	mvccStore mocktikv.MVCCStore
 	store     kv.Storage
+	dom       *domain.Domain
 	*parser.Parser
 }
 
@@ -62,13 +64,18 @@ func (s *testMySQLConstSuite) SetUpSuite(c *C) {
 		session.SetSchemaLease(0)
 		session.SetStatsLease(0)
 	}
-	_, err := session.BootstrapSession(s.store)
+	var err error
+	s.dom, err = session.BootstrapSession(s.store)
 	c.Assert(err, IsNil)
 }
 
-func (s *testMySQLConstSuite) TestGetSQLMode(c *C) {
-	defer testleak.AfterTest(c)()
+func (s *testMySQLConstSuite) TearDownSuite(c *C) {
+	s.dom.Close()
+	s.store.Close()
+	testleak.AfterTest(c)()
+}
 
+func (s *testMySQLConstSuite) TestGetSQLMode(c *C) {
 	positiveCases := []struct {
 		arg string
 	}{
@@ -101,8 +108,6 @@ func (s *testMySQLConstSuite) TestGetSQLMode(c *C) {
 }
 
 func (s *testMySQLConstSuite) TestSQLMode(c *C) {
-	defer testleak.AfterTest(c)()
-
 	tests := []struct {
 		arg                           string
 		hasNoZeroDateMode             bool
@@ -296,4 +301,21 @@ func (s *testMySQLConstSuite) TestNoBackslashEscapesMode(c *C) {
 	tk.MustExec("set sql_mode='NO_BACKSLASH_ESCAPES'")
 	r = tk.MustQuery("SELECT '\\\\'")
 	r.Check(testkit.Rows("\\\\"))
+}
+
+func (s *testMySQLConstSuite) TestServerStatus(c *C) {
+	tests := []struct {
+		arg            uint16
+		IsCursorExists bool
+	}{
+		{0, false},
+		{mysql.ServerStatusInTrans | mysql.ServerStatusNoBackslashEscaped, false},
+		{mysql.ServerStatusCursorExists, true},
+		{mysql.ServerStatusCursorExists | mysql.ServerStatusLastRowSend, true},
+	}
+
+	for _, t := range tests {
+		ret := mysql.HasCursorExistsFlag(t.arg)
+		c.Assert(ret, Equals, t.IsCursorExists)
+	}
 }

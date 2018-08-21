@@ -48,10 +48,10 @@ func NewTestStore(c *C) kv.Storage {
 		return store
 	}
 
-	client, pdClient, err := mocktikv.NewTestClient(nil, nil, "")
+	client, pdClient, err := mocktikv.NewTiKVAndPDClient(nil, nil, "")
 	c.Assert(err, IsNil)
 
-	store, err := NewTestTiKVStore(client, pdClient, nil, nil)
+	store, err := NewTestTiKVStore(client, pdClient, nil, nil, 0)
 	c.Assert(err, IsNil)
 	return store
 }

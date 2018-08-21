@@ -16,7 +16,6 @@ package statistics
 import (
 	"encoding/binary"
 	"math"
-	"time"
 
 	"github.com/pingcap/tidb/mysql"
 	"github.com/pingcap/tidb/sessionctx/stmtctx"
@@ -67,13 +66,9 @@ func convertDatumToScalar(value *types.Datum, commonPfxLen int) float64 {
 				Fsp:  types.DefaultFsp,
 			}
 		case mysql.TypeTimestamp:
-			minTime = types.Time{
-				Time: types.MinTimestamp,
-				Type: mysql.TypeTimestamp,
-				Fsp:  types.DefaultFsp,
-			}
+			minTime = types.MinTimestamp
 		}
-		sc := &stmtctx.StatementContext{TimeZone: time.UTC}
+		sc := &stmtctx.StatementContext{TimeZone: types.BoundTimezone}
 		return float64(valueTime.Sub(sc, &minTime).Duration)
 	case types.KindString, types.KindBytes:
 		bytes := value.GetBytes()
@@ -131,7 +126,7 @@ func (hg *Histogram) calcFraction(index int, value *types.Datum) float64 {
 	case types.KindUint64:
 		return calcFraction(float64(lower.GetUint64(0)), float64(upper.GetUint64(0)), float64(value.GetUint64()))
 	case types.KindMysqlDuration:
-		return calcFraction(float64(lower.GetDuration(0).Duration), float64(upper.GetDuration(0).Duration), float64(value.GetMysqlDuration().Duration))
+		return calcFraction(float64(lower.GetDuration(0, 0).Duration), float64(upper.GetDuration(0, 0).Duration), float64(value.GetMysqlDuration().Duration))
 	case types.KindMysqlDecimal, types.KindMysqlTime:
 		return calcFraction(hg.scalars[index].lower, hg.scalars[index].upper, convertDatumToScalar(value, 0))
 	case types.KindBytes, types.KindString:

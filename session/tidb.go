@@ -30,10 +30,10 @@ import (
 	"github.com/pingcap/tidb/domain"
 	"github.com/pingcap/tidb/executor"
 	"github.com/pingcap/tidb/kv"
+	"github.com/pingcap/tidb/mysql"
 	"github.com/pingcap/tidb/parser"
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/terror"
-	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util"
 	"github.com/pingcap/tidb/util/chunk"
 	log "github.com/sirupsen/logrus"
@@ -106,9 +106,6 @@ var (
 
 	// statsLease is the time for reload stats table.
 	statsLease = 3 * time.Second
-
-	// The maximum number of retries to recover from retryable errors.
-	commitRetryLimit uint = 10
 )
 
 // SetSchemaLease changes the default schema lease time for DDL.
@@ -121,15 +118,6 @@ func SetSchemaLease(lease time.Duration) {
 // SetStatsLease changes the default stats lease time for loading stats info.
 func SetStatsLease(lease time.Duration) {
 	statsLease = lease
-}
-
-// SetCommitRetryLimit setups the maximum number of retries when trying to recover
-// from retryable errors.
-// Retryable errors are generally refer to temporary errors that are expected to be
-// reinstated by retry, including network interruption, transaction conflicts, and
-// so on.
-func SetCommitRetryLimit(limit uint) {
-	commitRetryLimit = limit
 }
 
 // Parse parses a query string to raw ast.StmtNode.
@@ -212,11 +200,11 @@ func GetHistory(ctx sessionctx.Context) *StmtHistory {
 }
 
 // GetRows4Test gets all the rows from a RecordSet, only used for test.
-func GetRows4Test(ctx context.Context, sctx sessionctx.Context, rs ast.RecordSet) ([]types.Row, error) {
+func GetRows4Test(ctx context.Context, sctx sessionctx.Context, rs ast.RecordSet) ([]chunk.Row, error) {
 	if rs == nil {
 		return nil, nil
 	}
-	var rows []types.Row
+	var rows []chunk.Row
 	for {
 		// Since we collect all the rows, we can not reuse the chunk.
 		chk := rs.NewChunk()
@@ -342,5 +330,18 @@ func IsQuery(sql string) bool {
 	return false
 }
 
+var (
+	errForUpdateCantRetry = terror.ClassSession.New(codeForUpdateCantRetry,
+		mysql.MySQLErrName[mysql.ErrForUpdateCantRetry])
+)
+
+const (
+	codeForUpdateCantRetry terror.ErrCode = mysql.ErrForUpdateCantRetry
+)
+
 func init() {
+	sessionMySQLErrCodes := map[terror.ErrCode]uint16{
+		codeForUpdateCantRetry: mysql.ErrForUpdateCantRetry,
+	}
+	terror.ErrClassToMySQLCodes[terror.ClassSession] = sessionMySQLErrCodes
 }

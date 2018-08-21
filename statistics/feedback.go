@@ -16,15 +16,18 @@ package statistics
 import (
 	"bytes"
 	"encoding/gob"
+	"fmt"
 	"math"
 	"math/rand"
 	"sort"
+	"time"
 
 	"github.com/cznic/mathutil"
 	"github.com/juju/errors"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/metrics"
 	"github.com/pingcap/tidb/mysql"
+	"github.com/pingcap/tidb/sessionctx/stmtctx"
 	"github.com/pingcap/tidb/tablecodec"
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util/chunk"
@@ -91,6 +94,64 @@ func (q *QueryFeedback) CollectFeedback(numOfRanges int) bool {
 	return true
 }
 
+// DecodeToRanges decode the feedback to ranges.
+func (q *QueryFeedback) DecodeToRanges(isIndex bool) ([]*ranger.Range, error) {
+	ranges := make([]*ranger.Range, 0, len(q.feedback))
+	for _, val := range q.feedback {
+		low, high := *val.lower, *val.upper
+		var lowVal, highVal []types.Datum
+		if isIndex {
+			var err error
+			// As we do not know the origin length, just use a custom value here.
+			lowVal, err = codec.DecodeRange(low.GetBytes(), 4)
+			if err != nil {
+				return nil, errors.Trace(err)
+			}
+			highVal, err = codec.DecodeRange(high.GetBytes(), 4)
+			if err != nil {
+				return nil, errors.Trace(err)
+			}
+		} else {
+			_, lowInt, err := codec.DecodeInt(val.lower.GetBytes())
+			if err != nil {
+				return nil, errors.Trace(err)
+			}
+			_, highInt, err := codec.DecodeInt(val.upper.GetBytes())
+			if err != nil {
+				return nil, errors.Trace(err)
+			}
+			lowVal = []types.Datum{types.NewIntDatum(lowInt)}
+			highVal = []types.Datum{types.NewIntDatum(highInt)}
+		}
+		ranges = append(ranges, &(ranger.Range{
+			LowVal:      lowVal,
+			HighVal:     highVal,
+			HighExclude: true,
+		}))
+	}
+	return ranges, nil
+}
+
+func (q *QueryFeedback) decodeIntValues() *QueryFeedback {
+	nq := &QueryFeedback{}
+	nq.feedback = make([]feedback, 0, len(q.feedback))
+	for _, fb := range q.feedback {
+		_, lowInt, err := codec.DecodeInt(fb.lower.GetBytes())
+		if err != nil {
+			log.Debugf("decode feedback lower bound \"%v\" to integer failed: %v", fb.lower.GetBytes(), err)
+			continue
+		}
+		_, highInt, err := codec.DecodeInt(fb.upper.GetBytes())
+		if err != nil {
+			log.Debugf("decode feedback upper bound \"%v\" to integer failed: %v", fb.upper.GetBytes(), err)
+			continue
+		}
+		low, high := types.NewIntDatum(lowInt), types.NewIntDatum(highInt)
+		nq.feedback = append(nq.feedback, feedback{lower: &low, upper: &high, count: fb.count})
+	}
+	return nq
+}
+
 // StoreRanges stores the ranges for update.
 func (q *QueryFeedback) StoreRanges(ranges []*ranger.Range) {
 	q.feedback = make([]feedback, 0, len(ranges))
@@ -138,7 +199,7 @@ func (q *QueryFeedback) Update(startKey kv.Key, counts []int64) {
 		return
 	}
 
-	if q.hist.tp.Tp == mysql.TypeBlob {
+	if q.hist.isIndexHist() {
 		startKey = tablecodec.CutIndexPrefix(startKey)
 	} else {
 		startKey = tablecodec.CutRowKeyPrefix(startKey)
@@ -169,29 +230,11 @@ func (q *QueryFeedback) Update(startKey kv.Key, counts []int64) {
 	return
 }
 
-// DecodeInt decodes the int value stored in the feedback.
-func (q *QueryFeedback) DecodeInt() error {
-	for _, fb := range q.feedback {
-		_, v, err := codec.DecodeInt(fb.lower.GetBytes())
-		if err != nil {
-			return errors.Trace(err)
-		}
-		fb.lower.SetInt64(v)
-		_, v, err = codec.DecodeInt(fb.upper.GetBytes())
-		if err != nil {
-			return errors.Trace(err)
-		}
-		fb.upper.SetInt64(v)
-	}
-	return nil
-}
-
 // BucketFeedback stands for all the feedback for a bucket.
 type BucketFeedback struct {
 	feedback []feedback   // All the feedback info in the same bucket.
 	lower    *types.Datum // The lower bound of the new bucket.
 	upper    *types.Datum // The upper bound of the new bucket.
-	scalar   scalar       // The scalar info for the boundary.
 }
 
 // buildBucketFeedback build the feedback for each bucket from the histogram feedback.
@@ -279,71 +322,119 @@ func (b *BucketFeedback) getBoundaries(num int) []types.Datum {
 	return vals[:total]
 }
 
+// There are only two types of datum in bucket: one is `Blob`, which is for index; the other one
+// is `Int`, which is for primary key.
 type bucket = feedback
 
-// Get the fraction of the [lowerVal, upperVal] that intersect with the bucket boundary.
-func (b *BucketFeedback) getFraction(lowerVal, upperVal *types.Datum) float64 {
-	var lower, upper float64
-	if b.lower.Kind() == types.KindBytes {
-		value := lowerVal.GetBytes()
-		lower = convertBytesToScalar(value[b.scalar.commonPfxLen:])
-		value = upperVal.GetBytes()
-		upper = convertBytesToScalar(value[b.scalar.commonPfxLen:])
-	} else {
-		lower = float64(lowerVal.GetInt64())
-		upper = float64(upperVal.GetInt64())
-	}
-	return calcFraction(b.scalar.lower, b.scalar.upper, upper) - calcFraction(b.scalar.lower, b.scalar.upper, lower)
-}
-
-func (b *BucketFeedback) getBucketCount() int64 {
-	// Get the scalar info for boundary.
-	prefixLen := commonPrefixLength(b.lower.GetBytes(), b.upper.GetBytes())
-	if b.lower.Kind() == types.KindBytes {
-		b.scalar.commonPfxLen = commonPrefixLength(b.lower.GetBytes(), b.upper.GetBytes())
-		b.scalar.lower = convertBytesToScalar(b.lower.GetBytes()[prefixLen:])
-		b.scalar.upper = convertBytesToScalar(b.upper.GetBytes()[prefixLen:])
-	} else {
-		b.scalar.lower = float64(b.lower.GetInt64())
-		b.scalar.upper = float64(b.upper.GetInt64())
-	}
-	// Use the feedback that covers most to update this bucket's count.
-	var maxFraction, count float64
-	for _, fb := range b.feedback {
-		fraction := b.getFraction(fb.lower, fb.upper)
-		if fraction > maxFraction {
-			maxFraction = fraction
-			count = float64(fb.count) / fraction
-		}
-	}
-	return int64(count)
-}
-
-// updateBucket split the bucket according to feedback.
-func (b *BucketFeedback) splitBucket(newBktNum int, totalCount float64, count float64) []bucket {
-	// do not split if the count is already too small.
-	if newBktNum <= 1 || count < minBucketFraction*totalCount {
-		bkt := bucket{lower: b.lower, upper: b.upper, count: int64(count)}
-		return []bucket{bkt}
-	}
+// splitBucket firstly splits this "BucketFeedback" to "newNumBkts" new buckets,
+// calculates the count for each new bucket, merge the new bucket whose count
+// is smaller than "minBucketFraction*totalCount" with the next new bucket
+// until the last new bucket.
+func (b *BucketFeedback) splitBucket(newNumBkts int, totalCount float64, originBucketCount float64) []bucket {
 	// Split the bucket.
-	bounds := b.getBoundaries(newBktNum)
+	bounds := b.getBoundaries(newNumBkts + 1)
 	bkts := make([]bucket, 0, len(bounds)-1)
 	for i := 1; i < len(bounds); i++ {
-		newCount := int64(count * b.getFraction(&bounds[i-1], &bounds[i]))
+		newBkt := bucket{&bounds[i-1], bounds[i].Copy(), 0, 0}
+		// get bucket count
+		_, ratio := getOverlapFraction(feedback{b.lower, b.upper, int64(originBucketCount), 0}, newBkt)
+		countInNewBkt := originBucketCount * ratio
+		countInNewBkt = b.refineBucketCount(newBkt, countInNewBkt)
 		// do not split if the count of result bucket is too small.
-		if float64(newCount) < minBucketFraction*totalCount {
+		if countInNewBkt < minBucketFraction*totalCount {
 			bounds[i] = bounds[i-1]
 			continue
 		}
-		bkts = append(bkts, bucket{lower: &bounds[i-1], upper: &bounds[i], count: newCount, repeat: 0})
+		newBkt.count = int64(countInNewBkt)
+		bkts = append(bkts, newBkt)
+		// To guarantee that each bucket's range will not overlap.
+		if bounds[i].Kind() == types.KindBytes {
+			bounds[i].SetBytes(kv.Key(bounds[i].GetBytes()).PrefixNext())
+		} else if bounds[i].Kind() == types.KindInt64 {
+			bounds[i].SetInt64(bounds[i].GetInt64() + 1)
+		} else if bounds[i].Kind() == types.KindUint64 {
+			bounds[i].SetUint64(bounds[i].GetUint64() + 1)
+		}
 	}
 	return bkts
 }
 
-// Get the split count for the histogram.
-func getSplitCount(count int) int {
-	return mathutil.Min(10, count/10)
+func getFraction4PK(minValue, maxValue, lower, upper *types.Datum) (float64, float64) {
+	if minValue.Kind() == types.KindInt64 {
+		l, r := float64(minValue.GetInt64()), float64(maxValue.GetInt64())
+		return calcFraction(l, r, float64(lower.GetInt64())), calcFraction(l, r, float64(upper.GetInt64()))
+	}
+	l, r := float64(minValue.GetUint64()), float64(maxValue.GetUint64())
+	return calcFraction(l, r, float64(lower.GetUint64())), calcFraction(l, r, float64(upper.GetUint64()))
+}
+
+func getFraction4Index(minValue, maxValue, lower, upper *types.Datum, prefixLen int) (float64, float64) {
+	l, r := convertBytesToScalar(minValue.GetBytes()[prefixLen:]), convertBytesToScalar(maxValue.GetBytes()[prefixLen:])
+	return calcFraction(l, r, convertBytesToScalar(lower.GetBytes()[prefixLen:])),
+		calcFraction(l, r, convertBytesToScalar(upper.GetBytes()[prefixLen:]))
+}
+
+// getOverlapFraction gets the overlap fraction of feedback and bucket range. In order to get the bucket count, it also
+// returns the ratio between bucket fraction and feedback fraction.
+func getOverlapFraction(fb feedback, bkt bucket) (float64, float64) {
+	datums := make([]types.Datum, 0, 4)
+	datums = append(datums, *fb.lower, *fb.upper)
+	datums = append(datums, *bkt.lower, *bkt.upper)
+	err := types.SortDatums(nil, datums)
+	if err != nil {
+		return 0, 0
+	}
+	var fbLower, fbUpper, bktLower, bktUpper float64
+	minValue, maxValue := &datums[0], &datums[3]
+	if datums[0].Kind() == types.KindBytes {
+		prefixLen := commonPrefixLength(minValue.GetBytes(), maxValue.GetBytes())
+		fbLower, fbUpper = getFraction4Index(minValue, maxValue, fb.lower, fb.upper, prefixLen)
+		bktLower, bktUpper = getFraction4Index(minValue, maxValue, bkt.lower, bkt.upper, prefixLen)
+	} else {
+		fbLower, fbUpper = getFraction4PK(minValue, maxValue, fb.lower, fb.upper)
+		bktLower, bktUpper = getFraction4PK(minValue, maxValue, bkt.lower, bkt.upper)
+	}
+	ratio := (bktUpper - bktLower) / (fbUpper - fbLower)
+	// full overlap
+	if fbLower <= bktLower && bktUpper <= fbUpper {
+		return bktUpper - bktLower, ratio
+	}
+	if bktLower <= fbLower && fbUpper <= bktUpper {
+		return fbUpper - fbLower, ratio
+	}
+	// partial overlap
+	overlap := math.Min(bktUpper-fbLower, fbUpper-bktLower)
+	return overlap, ratio
+}
+
+// refineBucketCount refine the newly split bucket count. It uses the feedback that overlaps most
+// with the bucket to get the bucket count.
+func (b *BucketFeedback) refineBucketCount(bkt bucket, defaultCount float64) float64 {
+	bestFraction := minBucketFraction
+	count := defaultCount
+	for _, fb := range b.feedback {
+		fraction, ratio := getOverlapFraction(fb, bkt)
+		// choose the max overlap fraction
+		if fraction > bestFraction {
+			bestFraction = fraction
+			count = float64(fb.count) * ratio
+		}
+	}
+	return count
+}
+
+const (
+	defaultSplitCount = 10
+	splitPerFeedback  = 10
+)
+
+// getSplitCount gets the split count for the histogram. It is based on the intuition that:
+// 1: If we have more remaining unused buckets, we can split more.
+// 2: We cannot split too aggressive, thus we make it split every `splitPerFeedback`.
+func getSplitCount(numFeedbacks, remainBuckets int) int {
+	// Split more if have more buckets available.
+	splitCount := mathutil.Max(remainBuckets, defaultSplitCount)
+	return mathutil.Min(splitCount, numFeedbacks/splitPerFeedback)
 }
 
 type bucketScore struct {
@@ -429,33 +520,23 @@ func mergeBuckets(bkts []bucket, isNewBuckets []bool, totalCount float64) []buck
 	return bkts
 }
 
+// splitBuckets split the histogram buckets according to the feedback.
 func splitBuckets(h *Histogram, feedback *QueryFeedback) ([]bucket, []bool, int64) {
-	bktID2FB, fbNum := buildBucketFeedback(h, feedback)
-	counts := make([]int64, 0, h.Len())
-	for i := 0; i < h.Len(); i++ {
-		bkt, ok := bktID2FB[i]
-		if !ok {
-			counts = append(counts, h.bucketCount(i))
-		} else {
-			counts = append(counts, bkt.getBucketCount())
-		}
-	}
-	totCount := int64(0)
-	for _, count := range counts {
-		totCount += count
-	}
+	bktID2FB, numTotalFBs := buildBucketFeedback(h, feedback)
 	buckets := make([]bucket, 0, h.Len())
 	isNewBuckets := make([]bool, 0, h.Len())
-	splitCount := getSplitCount(fbNum)
+	splitCount := getSplitCount(numTotalFBs, defaultBucketCount-h.Len())
 	for i := 0; i < h.Len(); i++ {
-		bkt, ok := bktID2FB[i]
+		bktFB, ok := bktID2FB[i]
 		// No feedback, just use the original one.
 		if !ok {
-			buckets = append(buckets, bucket{h.GetLower(i), h.GetUpper(i), counts[i], h.Buckets[i].Repeat})
+			buckets = append(buckets, bucket{h.GetLower(i), h.GetUpper(i), h.bucketCount(i), h.Buckets[i].Repeat})
 			isNewBuckets = append(isNewBuckets, false)
 			continue
 		}
-		bkts := bkt.splitBucket(splitCount*len(bkt.feedback)/fbNum, float64(totCount), float64(counts[i]))
+		// Distribute the total split count to bucket based on number of bucket feedback.
+		newBktNums := splitCount * len(bktFB.feedback) / numTotalFBs
+		bkts := bktFB.splitBucket(newBktNums, h.totalRowCount(), float64(h.bucketCount(i)))
 		buckets = append(buckets, bkts...)
 		if len(bkts) == 1 {
 			isNewBuckets = append(isNewBuckets, false)
@@ -465,6 +546,10 @@ func splitBuckets(h *Histogram, feedback *QueryFeedback) ([]bucket, []bool, int6
 			}
 		}
 	}
+	totCount := int64(0)
+	for _, bkt := range buckets {
+		totCount += bkt.count
+	}
 	return buckets, isNewBuckets, totCount
 }
 
@@ -473,6 +558,19 @@ func UpdateHistogram(h *Histogram, feedback *QueryFeedback) *Histogram {
 	buckets, isNewBuckets, totalCount := splitBuckets(h, feedback)
 	buckets = mergeBuckets(buckets, isNewBuckets, float64(totalCount))
 	return buildNewHistogram(h, buckets)
+}
+
+// UpdateCMSketch updates the CMSketch by feedback.
+func UpdateCMSketch(c *CMSketch, eqFeedbacks []feedback) *CMSketch {
+	if c == nil || len(eqFeedbacks) == 0 {
+		return c
+	}
+	newCMSketch := c.copy()
+	for _, fb := range eqFeedbacks {
+		h1, h2 := murmur3.Sum128(fb.lower.GetBytes())
+		newCMSketch.setValue(h1, h2, uint32(fb.count))
+	}
+	return newCMSketch
 }
 
 func buildNewHistogram(h *Histogram, buckets []bucket) *Histogram {
@@ -496,15 +594,19 @@ type queryFeedback struct {
 func encodePKFeedback(q *QueryFeedback) (*queryFeedback, error) {
 	pb := &queryFeedback{}
 	for _, fb := range q.feedback {
-		err := q.DecodeInt()
+		// There is no need to update the point queries.
+		if bytes.Compare(kv.Key(fb.lower.GetBytes()).PrefixNext(), fb.upper.GetBytes()) >= 0 {
+			continue
+		}
+		_, low, err := codec.DecodeInt(fb.lower.GetBytes())
 		if err != nil {
 			return nil, errors.Trace(err)
 		}
-		// There is no need to update the point queries.
-		if fb.upper.GetInt64()-fb.lower.GetInt64() <= 1 {
-			continue
+		_, high, err := codec.DecodeInt(fb.upper.GetBytes())
+		if err != nil {
+			return nil, errors.Trace(err)
 		}
-		pb.IntRanges = append(pb.IntRanges, fb.lower.GetInt64(), fb.upper.GetInt64())
+		pb.IntRanges = append(pb.IntRanges, low, high)
 		pb.Counts = append(pb.Counts, fb.count)
 	}
 	return pb, nil
@@ -530,7 +632,7 @@ func encodeIndexFeedback(q *QueryFeedback) *queryFeedback {
 func encodeFeedback(q *QueryFeedback) ([]byte, error) {
 	var pb *queryFeedback
 	var err error
-	if q.hist.tp.Tp == mysql.TypeBlob {
+	if q.hist.isIndexHist() {
 		pb = encodeIndexFeedback(q)
 	} else {
 		pb, err = encodePKFeedback(q)
@@ -555,22 +657,17 @@ func decodeFeedback(val []byte, q *QueryFeedback, c *CMSketch) error {
 	if err != nil {
 		return errors.Trace(err)
 	}
-	// decode feedback for index
-	if len(pb.IndexRanges) > 0 {
-		// decode the index range feedback
-		for i := 0; i < len(pb.IndexRanges); i += 2 {
-			lower, upper := types.NewBytesDatum(pb.IndexRanges[i]), types.NewBytesDatum(pb.IndexRanges[i+1])
-			q.feedback = append(q.feedback, feedback{&lower, &upper, pb.Counts[i/2], 0})
-		}
-		if c == nil {
-			return nil
-		}
+	// decode the index range feedback
+	for i := 0; i < len(pb.IndexRanges); i += 2 {
+		lower, upper := types.NewBytesDatum(pb.IndexRanges[i]), types.NewBytesDatum(pb.IndexRanges[i+1])
+		q.feedback = append(q.feedback, feedback{&lower, &upper, pb.Counts[i/2], 0})
+	}
+	if c != nil {
 		// decode the index point feedback, just set value count in CM Sketch
 		start := len(pb.IndexRanges) / 2
 		for i := 0; i < len(pb.HashValues); i += 2 {
 			c.setValue(pb.HashValues[i], pb.HashValues[i+1], uint32(pb.Counts[start+i/2]))
 		}
-		return nil
 	}
 	// decode feedback for primary key
 	for i := 0; i < len(pb.IntRanges); i += 2 {
@@ -607,4 +704,191 @@ func (q *QueryFeedback) Equal(rq *QueryFeedback) bool {
 		}
 	}
 	return true
+}
+
+// recalculateExpectCount recalculates the expect row count if the origin row count is estimated by pseudo.
+func (q *QueryFeedback) recalculateExpectCount(h *Handle) error {
+	t, ok := h.statsCache.Load().(statsCache)[q.tableID]
+	if !ok {
+		return nil
+	}
+	tablePseudo := t.Pseudo || t.IsOutdated()
+	if tablePseudo == false {
+		return nil
+	}
+	isIndex := q.hist.tp.Tp == mysql.TypeBlob
+	id := q.hist.ID
+	if isIndex && (t.Indices[id] == nil || t.Indices[id].NotAccurate() == false) {
+		return nil
+	}
+	if !isIndex && (t.Columns[id] == nil || t.Columns[id].NotAccurate() == false) {
+		return nil
+	}
+
+	sc := &stmtctx.StatementContext{TimeZone: time.UTC}
+	ranges, err := q.DecodeToRanges(isIndex)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	expected := 0.0
+	if isIndex {
+		idx := t.Indices[id]
+		expected, err = idx.getRowCount(sc, ranges, t.ModifyCount)
+		expected *= idx.getIncreaseFactor(t.Count)
+	} else {
+		c := t.Columns[id]
+		expected, err = c.getColumnRowCount(sc, ranges, t.ModifyCount)
+		expected *= c.getIncreaseFactor(t.Count)
+	}
+	if err != nil {
+		return errors.Trace(err)
+	}
+	q.expected = int64(expected)
+	return nil
+}
+
+// splitFeedback splits the feedbacks into equality feedbacks and range feedbacks.
+func splitFeedbackByQueryType(feedbacks []feedback) ([]feedback, []feedback) {
+	var eqFB, ranFB []feedback
+	for _, fb := range feedbacks {
+		// Use `>=` here because sometimes the lower is equal to upper.
+		if bytes.Compare(kv.Key(fb.lower.GetBytes()).PrefixNext(), fb.upper.GetBytes()) >= 0 {
+			eqFB = append(eqFB, fb)
+		} else {
+			ranFB = append(ranFB, fb)
+		}
+	}
+	return eqFB, ranFB
+}
+
+// formatBuckets formats bucket from lowBkt to highBkt.
+func formatBuckets(hg *Histogram, lowBkt, highBkt, idxCols int) string {
+	if lowBkt == highBkt {
+		return hg.bucketToString(lowBkt, idxCols)
+	}
+	if lowBkt+1 == highBkt {
+		return fmt.Sprintf("%s, %s", hg.bucketToString(lowBkt, 0), hg.bucketToString(highBkt, 0))
+	}
+	// do not care the middle buckets
+	return fmt.Sprintf("%s, (%d buckets, total count %d), %s", hg.bucketToString(lowBkt, 0),
+		highBkt-lowBkt-1, hg.Buckets[highBkt-1].Count-hg.Buckets[lowBkt].Count, hg.bucketToString(highBkt, 0))
+}
+
+func colRangeToStr(c *Column, ran *ranger.Range, actual int64, factor float64) string {
+	lowCount, lowBkt := c.lessRowCountWithBktIdx(ran.LowVal[0])
+	highCount, highBkt := c.lessRowCountWithBktIdx(ran.HighVal[0])
+	return fmt.Sprintf("range: %s, actual: %d, expected: %d, buckets: {%s}", ran.String(), actual,
+		int64((highCount-lowCount)*factor), formatBuckets(&c.Histogram, lowBkt, highBkt, 0))
+}
+
+func logForPK(prefix string, c *Column, ranges []*ranger.Range, actual []int64, factor float64) {
+	for i, ran := range ranges {
+		if ran.LowVal[0].GetInt64()+1 >= ran.HighVal[0].GetInt64() {
+			continue
+		}
+		log.Debugf("%s column: %s, %s", prefix, c.Info.Name, colRangeToStr(c, ran, actual[i], factor))
+	}
+}
+
+func logForIndexRange(idx *Index, ran *ranger.Range, actual int64, factor float64) string {
+	sc := &stmtctx.StatementContext{TimeZone: time.UTC}
+	lb, err := codec.EncodeKey(sc, nil, ran.LowVal...)
+	if err != nil {
+		return ""
+	}
+	rb, err := codec.EncodeKey(sc, nil, ran.HighVal...)
+	if err != nil {
+		return ""
+	}
+	if idx.CMSketch != nil && bytes.Compare(kv.Key(lb).PrefixNext(), rb) >= 0 {
+		str, err := types.DatumsToString(ran.LowVal, true)
+		if err != nil {
+			return ""
+		}
+		return fmt.Sprintf("value: %s, actual: %d, expected: %d", str, actual, int64(float64(idx.QueryBytes(lb))*factor))
+	}
+	l, r := types.NewBytesDatum(lb), types.NewBytesDatum(rb)
+	lowCount, lowBkt := idx.lessRowCountWithBktIdx(l)
+	highCount, highBkt := idx.lessRowCountWithBktIdx(r)
+	return fmt.Sprintf("range: %s, actual: %d, expected: %d, histogram: {%s}", ran.String(), actual,
+		int64((highCount-lowCount)*factor), formatBuckets(&idx.Histogram, lowBkt, highBkt, len(idx.Info.Columns)))
+}
+
+func logForIndex(prefix string, t *Table, idx *Index, ranges []*ranger.Range, actual []int64, factor float64) {
+	sc := &stmtctx.StatementContext{TimeZone: time.UTC}
+	if idx.CMSketch == nil || idx.statsVer != version1 {
+		for i, ran := range ranges {
+			log.Debugf("%s index: %s, %s", prefix, idx.Info.Name.O, logForIndexRange(idx, ran, actual[i], factor))
+		}
+		return
+	}
+	for i, ran := range ranges {
+		rangePosition := getOrdinalOfRangeCond(sc, ran)
+		// only contains range or equality query
+		if rangePosition == 0 || rangePosition == len(ran.LowVal) {
+			log.Debugf("%s index: %s, %s", prefix, idx.Info.Name.O, logForIndexRange(idx, ran, actual[i], factor))
+			continue
+		}
+		equalityString, err := types.DatumsToString(ran.LowVal[:rangePosition], true)
+		if err != nil {
+			continue
+		}
+		bytes, err := codec.EncodeKey(sc, nil, ran.LowVal[:rangePosition]...)
+		if err != nil {
+			continue
+		}
+		equalityCount := idx.CMSketch.QueryBytes(bytes)
+		rang := ranger.Range{
+			LowVal:  []types.Datum{ran.LowVal[rangePosition]},
+			HighVal: []types.Datum{ran.HighVal[rangePosition]},
+		}
+		colName := idx.Info.Columns[rangePosition].Name.L
+		var rangeString string
+		// prefer index stats over column stats
+		if idx, ok := t.colName2Idx[colName]; ok {
+			if t.Indices[idx] == nil {
+				return
+			}
+			rangeString = logForIndexRange(t.Indices[idx], &rang, -1, factor)
+		} else {
+			id := t.colName2ID[colName]
+			if t.Columns[id] == nil {
+				return
+			}
+			rangeString = colRangeToStr(t.Columns[t.colName2ID[colName]], &rang, -1, factor)
+		}
+		log.Debugf("%s index: %s, actual: %d, equality: %s, expected equality: %d, %s", prefix, idx.Info.Name.O,
+			actual[i], equalityString, equalityCount, rangeString)
+	}
+}
+
+func (q *QueryFeedback) logDetailedInfo(h *Handle) {
+	t, ok := h.statsCache.Load().(statsCache)[q.tableID]
+	if !ok {
+		return
+	}
+	isIndex := q.hist.isIndexHist()
+	ranges, err := q.DecodeToRanges(isIndex)
+	if err != nil {
+		log.Debug(err)
+		return
+	}
+	actual := make([]int64, 0, len(q.feedback))
+	for _, fb := range q.feedback {
+		actual = append(actual, fb.count)
+	}
+	logPrefix := fmt.Sprintf("[stats-feedback] %s,", t.name)
+	if isIndex {
+		idx := t.Indices[q.hist.ID]
+		if idx == nil {
+			return
+		}
+		logForIndex(logPrefix, t, idx, ranges, actual, idx.getIncreaseFactor(t.Count))
+	} else {
+		c := t.Columns[q.hist.ID]
+		if c == nil {
+			return
+		}
+		logForPK(logPrefix, c, ranges, actual, c.getIncreaseFactor(t.Count))
+	}
 }

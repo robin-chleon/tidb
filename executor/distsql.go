@@ -29,6 +29,7 @@ import (
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/model"
 	"github.com/pingcap/tidb/mysql"
+	"github.com/pingcap/tidb/plan"
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/sessionctx/stmtctx"
 	"github.com/pingcap/tidb/statistics"
@@ -38,7 +39,7 @@ import (
 	"github.com/pingcap/tidb/util/chunk"
 	"github.com/pingcap/tidb/util/memory"
 	"github.com/pingcap/tidb/util/ranger"
-	tipb "github.com/pingcap/tipb/go-tipb"
+	"github.com/pingcap/tipb/go-tipb"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/net/context"
 )
@@ -117,68 +118,48 @@ func closeAll(objs ...Closeable) error {
 	return errors.Trace(err)
 }
 
-// timeZoneOffset returns the local time zone offset in seconds.
-func timeZoneOffset(ctx sessionctx.Context) int64 {
-	loc := ctx.GetSessionVars().GetTimeZone()
+// zone returns the current timezone name and timezone offset in seconds.
+// In compatible with MySQL, we change `Local` to `System`.
+// TODO: Golang team plan to return system timezone name intead of
+// returning `Local` when `loc` is `time.Local`. We need keep an eye on this.
+func zone(sctx sessionctx.Context) (string, int64) {
+	loc := sctx.GetSessionVars().Location()
 	_, offset := time.Now().In(loc).Zone()
-	return int64(offset)
-}
+	var name string
+	name = loc.String()
+	if name == "Local" {
+		name = "System"
+	}
 
-// Flags are used by tipb.SelectRequest.Flags to handle execution mode, like how to handle truncate error.
-const (
-	// FlagIgnoreTruncate indicates if truncate error should be ignored.
-	// Read-only statements should ignore truncate error, write statements should not ignore truncate error.
-	FlagIgnoreTruncate uint64 = 1
-	// FlagTruncateAsWarning indicates if truncate error should be returned as warning.
-	// This flag only matters if FlagIgnoreTruncate is not set, in strict sql mode, truncate error should
-	// be returned as error, in non-strict sql mode, truncate error should be saved as warning.
-	FlagTruncateAsWarning = 1 << 1
-	// FlagPadCharToFullLength indicates if sql_mode 'PAD_CHAR_TO_FULL_LENGTH' is set.
-	FlagPadCharToFullLength = 1 << 2
-	// FlagInInsertStmt indicates if this is a INSERT statement.
-	FlagInInsertStmt = 1 << 3
-	// FlagInUpdateOrDeleteStmt indicates if this is a UPDATE statement or a DELETE statement.
-	FlagInUpdateOrDeleteStmt = 1 << 4
-	// FlagInSelectStmt indicates if this is a SELECT statement.
-	FlagInSelectStmt = 1 << 5
-	// FlagOverflowAsWarning indicates if overflow error should be returned as warning.
-	// In strict sql mode, overflow error should be returned as error,
-	// in non-strict sql mode, overflow error should be saved as warning.
-	FlagOverflowAsWarning = 1 << 6
-	// FlagIgnoreZeroInDate indicates if ZeroInDate error should be ignored.
-	// Read-only statements should ignore ZeroInDate error.
-	// Write statements should not ignore ZeroInDate error in strict sql mode.
-	FlagIgnoreZeroInDate = 1 << 7
-	// FlagDividedByZeroAsWarning indicates if DividedByZero should be returned as warning.
-	FlagDividedByZeroAsWarning = 1 << 8
-)
+	return name, int64(offset)
+}
 
 // statementContextToFlags converts StatementContext to tipb.SelectRequest.Flags.
 func statementContextToFlags(sc *stmtctx.StatementContext) uint64 {
 	var flags uint64
 	if sc.InInsertStmt {
-		flags |= FlagInInsertStmt
+		flags |= model.FlagInInsertStmt
 	} else if sc.InUpdateOrDeleteStmt {
-		flags |= FlagInUpdateOrDeleteStmt
+		flags |= model.FlagInUpdateOrDeleteStmt
 	} else if sc.InSelectStmt {
-		flags |= FlagInSelectStmt
+		flags |= model.FlagInSelectStmt
 	}
 	if sc.IgnoreTruncate {
-		flags |= FlagIgnoreTruncate
+		flags |= model.FlagIgnoreTruncate
 	} else if sc.TruncateAsWarning {
-		flags |= FlagTruncateAsWarning
+		flags |= model.FlagTruncateAsWarning
 	}
 	if sc.OverflowAsWarning {
-		flags |= FlagOverflowAsWarning
+		flags |= model.FlagOverflowAsWarning
 	}
 	if sc.IgnoreZeroInDate {
-		flags |= FlagIgnoreZeroInDate
+		flags |= model.FlagIgnoreZeroInDate
 	}
 	if sc.DividedByZeroAsWarning {
-		flags |= FlagDividedByZeroAsWarning
+		flags |= model.FlagDividedByZeroAsWarning
 	}
 	if sc.PadCharToFullLength {
-		flags |= FlagPadCharToFullLength
+		flags |= model.FlagPadCharToFullLength
 	}
 	return flags
 }
@@ -189,91 +170,6 @@ func handleIsExtra(col *expression.Column) bool {
 		return true
 	}
 	return false
-}
-
-// TableReaderExecutor sends dag request and reads table data from kv layer.
-type TableReaderExecutor struct {
-	baseExecutor
-
-	table     table.Table
-	tableID   int64
-	keepOrder bool
-	desc      bool
-	ranges    []*ranger.Range
-	dagPB     *tipb.DAGRequest
-	// columns are only required by union scan.
-	columns []*model.ColumnInfo
-
-	// resultHandler handles the order of the result. Since (MAXInt64, MAXUint64] stores before [0, MaxInt64] physically
-	// for unsigned int.
-	resultHandler *tableResultHandler
-	streaming     bool
-	feedback      *statistics.QueryFeedback
-}
-
-// Close implements the Executor Close interface.
-func (e *TableReaderExecutor) Close() error {
-	e.ctx.StoreQueryFeedback(e.feedback)
-	err := e.resultHandler.Close()
-	return errors.Trace(err)
-}
-
-// Next fills data into the chunk passed by its caller.
-// The task was actually done by tableReaderHandler.
-func (e *TableReaderExecutor) Next(ctx context.Context, chk *chunk.Chunk) error {
-	err := e.resultHandler.nextChunk(ctx, chk)
-	if err != nil {
-		e.feedback.Invalidate()
-	}
-	return errors.Trace(err)
-}
-
-// Open initialzes necessary variables for using this executor.
-func (e *TableReaderExecutor) Open(ctx context.Context) error {
-	span, ctx := startSpanFollowsContext(ctx, "executor.TableReader.Open")
-	defer span.Finish()
-
-	e.resultHandler = &tableResultHandler{}
-	firstPartRanges, secondPartRanges := splitRanges(e.ranges, e.keepOrder)
-	firstResult, err := e.buildResp(ctx, firstPartRanges)
-	if err != nil {
-		e.feedback.Invalidate()
-		return errors.Trace(err)
-	}
-	if len(secondPartRanges) == 0 {
-		e.resultHandler.open(nil, firstResult)
-		return nil
-	}
-	var secondResult distsql.SelectResult
-	secondResult, err = e.buildResp(ctx, secondPartRanges)
-	if err != nil {
-		e.feedback.Invalidate()
-		return errors.Trace(err)
-	}
-	e.resultHandler.open(firstResult, secondResult)
-	return nil
-}
-
-// buildResp first build request and send it to tikv using distsql.Select. It uses SelectResut returned by the callee
-// to fetch all results.
-func (e *TableReaderExecutor) buildResp(ctx context.Context, ranges []*ranger.Range) (distsql.SelectResult, error) {
-	var builder distsql.RequestBuilder
-	kvReq, err := builder.SetTableRanges(e.tableID, ranges, e.feedback).
-		SetDAGRequest(e.dagPB).
-		SetDesc(e.desc).
-		SetKeepOrder(e.keepOrder).
-		SetStreaming(e.streaming).
-		SetFromSessionVars(e.ctx.GetSessionVars()).
-		Build()
-	if err != nil {
-		return nil, errors.Trace(err)
-	}
-	result, err := distsql.Select(ctx, e.ctx, kvReq, e.retTypes(), e.feedback)
-	if err != nil {
-		return nil, errors.Trace(err)
-	}
-	result.Fetch(ctx)
-	return result, nil
 }
 
 func splitRanges(ranges []*ranger.Range, keepOrder bool) ([]*ranger.Range, []*ranger.Range) {
@@ -326,17 +222,32 @@ func startSpanFollowsContext(ctx context.Context, operationName string) (opentra
 	return span, opentracing.ContextWithSpan(ctx, span)
 }
 
+// rebuildIndexRanges will be called if there's correlated column in access conditions. We will rebuild the range
+// by substitute correlated column with the constant.
+func rebuildIndexRanges(ctx sessionctx.Context, is *plan.PhysicalIndexScan, idxCols []*expression.Column, colLens []int) (ranges []*ranger.Range, err error) {
+	access := make([]expression.Expression, 0, len(is.AccessCondition))
+	for _, cond := range is.AccessCondition {
+		newCond, err1 := expression.SubstituteCorCol2Constant(cond)
+		if err1 != nil {
+			return nil, errors.Trace(err1)
+		}
+		access = append(access, newCond)
+	}
+	ranges, _, err = ranger.DetachSimpleCondAndBuildRangeForIndex(ctx, access, idxCols, colLens)
+	return ranges, err
+}
+
 // IndexReaderExecutor sends dag request and reads index data from kv layer.
 type IndexReaderExecutor struct {
 	baseExecutor
 
-	table     table.Table
-	index     *model.IndexInfo
-	tableID   int64
-	keepOrder bool
-	desc      bool
-	ranges    []*ranger.Range
-	dagPB     *tipb.DAGRequest
+	table           table.Table
+	index           *model.IndexInfo
+	physicalTableID int64
+	keepOrder       bool
+	desc            bool
+	ranges          []*ranger.Range
+	dagPB           *tipb.DAGRequest
 
 	// result returns one or more distsql.PartialResult and each PartialResult is returned by one region.
 	result distsql.SelectResult
@@ -344,6 +255,12 @@ type IndexReaderExecutor struct {
 	columns   []*model.ColumnInfo
 	streaming bool
 	feedback  *statistics.QueryFeedback
+
+	corColInFilter bool
+	corColInAccess bool
+	idxCols        []*expression.Column
+	colLens        []int
+	plans          []plan.PhysicalPlan
 }
 
 // Close clears all resources hold by current object.
@@ -365,7 +282,14 @@ func (e *IndexReaderExecutor) Next(ctx context.Context, chk *chunk.Chunk) error 
 
 // Open implements the Executor Open interface.
 func (e *IndexReaderExecutor) Open(ctx context.Context) error {
-	kvRanges, err := distsql.IndexRangesToKVRanges(e.ctx.GetSessionVars().StmtCtx, e.tableID, e.index.ID, e.ranges, e.feedback)
+	var err error
+	if e.corColInAccess {
+		e.ranges, err = rebuildIndexRanges(e.ctx, e.plans[0].(*plan.PhysicalIndexScan), e.idxCols, e.colLens)
+		if err != nil {
+			return errors.Trace(err)
+		}
+	}
+	kvRanges, err := distsql.IndexRangesToKVRanges(e.ctx.GetSessionVars().StmtCtx, e.physicalTableID, e.index.ID, e.ranges, e.feedback)
 	if err != nil {
 		e.feedback.Invalidate()
 		return errors.Trace(err)
@@ -376,6 +300,14 @@ func (e *IndexReaderExecutor) Open(ctx context.Context) error {
 func (e *IndexReaderExecutor) open(ctx context.Context, kvRanges []kv.KeyRange) error {
 	span, ctx := startSpanFollowsContext(ctx, "executor.IndexReader.Open")
 	defer span.Finish()
+
+	var err error
+	if e.corColInFilter {
+		e.dagPB.Executors, _, err = constructDistExec(e.ctx, e.plans)
+		if err != nil {
+			return errors.Trace(err)
+		}
+	}
 
 	var builder distsql.RequestBuilder
 	kvReq, err := builder.SetKeyRanges(kvRanges).
@@ -402,13 +334,13 @@ func (e *IndexReaderExecutor) open(ctx context.Context, kvRanges []kv.KeyRange) 
 type IndexLookUpExecutor struct {
 	baseExecutor
 
-	table     table.Table
-	index     *model.IndexInfo
-	tableID   int64
-	keepOrder bool
-	desc      bool
-	ranges    []*ranger.Range
-	dagPB     *tipb.DAGRequest
+	table           table.Table
+	index           *model.IndexInfo
+	physicalTableID int64
+	keepOrder       bool
+	desc            bool
+	ranges          []*ranger.Range
+	dagPB           *tipb.DAGRequest
 	// handleIdx is the index of handle, which is only used for case of keeping order.
 	handleIdx    int
 	tableRequest *tipb.DAGRequest
@@ -432,11 +364,26 @@ type IndexLookUpExecutor struct {
 
 	// isCheckOp is used to determine whether we need to check the consistency of the index data.
 	isCheckOp bool
+
+	corColInIdxSide bool
+	idxPlans        []plan.PhysicalPlan
+	corColInTblSide bool
+	tblPlans        []plan.PhysicalPlan
+	corColInAccess  bool
+	idxCols         []*expression.Column
+	colLens         []int
 }
 
 // Open implements the Executor Open interface.
 func (e *IndexLookUpExecutor) Open(ctx context.Context) error {
-	kvRanges, err := distsql.IndexRangesToKVRanges(e.ctx.GetSessionVars().StmtCtx, e.tableID, e.index.ID, e.ranges, e.feedback)
+	var err error
+	if e.corColInAccess {
+		e.ranges, err = rebuildIndexRanges(e.ctx, e.idxPlans[0].(*plan.PhysicalIndexScan), e.idxCols, e.colLens)
+		if err != nil {
+			return errors.Trace(err)
+		}
+	}
+	kvRanges, err := distsql.IndexRangesToKVRanges(e.ctx.GetSessionVars().StmtCtx, e.physicalTableID, e.index.ID, e.ranges, e.feedback)
 	if err != nil {
 		e.feedback.Invalidate()
 		return errors.Trace(err)
@@ -462,10 +409,25 @@ func (e *IndexLookUpExecutor) open(ctx context.Context, kvRanges []kv.KeyRange) 
 	e.finished = make(chan struct{})
 	e.resultCh = make(chan *lookupTableTask, atomic.LoadInt32(&LookupTableTaskChannelSize))
 
+	var err error
+	if e.corColInIdxSide {
+		e.dagPB.Executors, _, err = constructDistExec(e.ctx, e.idxPlans)
+		if err != nil {
+			return errors.Trace(err)
+		}
+	}
+
+	if e.corColInTblSide {
+		e.tableRequest.Executors, _, err = constructDistExec(e.ctx, e.tblPlans)
+		if err != nil {
+			return errors.Trace(err)
+		}
+	}
+
 	// indexWorker will write to workCh and tableWorker will read from workCh,
 	// so fetching index and getting table data can run concurrently.
 	workCh := make(chan *lookupTableTask, 1)
-	err := e.startIndexWorker(ctx, kvRanges, workCh)
+	err = e.startIndexWorker(ctx, kvRanges, workCh)
 	if err != nil {
 		return errors.Trace(err)
 	}
@@ -499,6 +461,7 @@ func (e *IndexLookUpExecutor) startIndexWorker(ctx context.Context, kvRanges []k
 		keepOrder:    e.keepOrder,
 		batchSize:    e.maxChunkSize,
 		maxBatchSize: e.ctx.GetSessionVars().IndexLookupSize,
+		maxChunkSize: e.maxChunkSize,
 	}
 	if worker.batchSize > worker.maxBatchSize {
 		worker.batchSize = worker.maxBatchSize
@@ -548,12 +511,14 @@ func (e *IndexLookUpExecutor) startTableWorker(ctx context.Context, workCh <-cha
 
 func (e *IndexLookUpExecutor) buildTableReader(ctx context.Context, handles []int64) (Executor, error) {
 	tableReader, err := e.dataReaderBuilder.buildTableReaderFromHandles(ctx, &TableReaderExecutor{
-		baseExecutor: newBaseExecutor(e.ctx, e.schema, e.id+"_tableReader"),
-		table:        e.table,
-		tableID:      e.tableID,
-		dagPB:        e.tableRequest,
-		streaming:    e.tableStreaming,
-		feedback:     statistics.NewQueryFeedback(0, nil, 0, false),
+		baseExecutor:    newBaseExecutor(e.ctx, e.schema, e.id+"_tableReader"),
+		table:           e.table,
+		physicalTableID: e.physicalTableID,
+		dagPB:           e.tableRequest,
+		streaming:       e.tableStreaming,
+		feedback:        statistics.NewQueryFeedback(0, nil, 0, false),
+		corColInFilter:  e.corColInTblSide,
+		plans:           e.tblPlans,
 	}, handles)
 	if err != nil {
 		log.Error(err)
@@ -632,6 +597,7 @@ type indexWorker struct {
 	// batchSize is for lightweight startup. It will be increased exponentially until reaches the max batch size value.
 	batchSize    int
 	maxBatchSize int
+	maxChunkSize int
 }
 
 // fetchHandles fetches a batch of handles from index data and builds the index lookup tasks.
@@ -655,7 +621,7 @@ func (w *indexWorker) fetchHandles(ctx context.Context, result distsql.SelectRes
 			}
 		}
 	}()
-	chk := chunk.NewChunk([]*types.FieldType{types.NewFieldType(mysql.TypeLonglong)})
+	chk := chunk.NewChunkWithCapacity([]*types.FieldType{types.NewFieldType(mysql.TypeLonglong)}, w.maxChunkSize)
 	for {
 		handles, err := w.extractTaskHandles(ctx, chk, result)
 		if err != nil {
@@ -847,64 +813,4 @@ func GetLackHandles(expectedHandles []int64, obtainedHandlesMap map[int64]struct
 	}
 
 	return diffHandles
-}
-
-type tableResultHandler struct {
-	// If the pk is unsigned and we have KeepOrder=true.
-	// optionalResult handles the request whose range is in signed int range.
-	// result handles the request whose range is exceed signed int range.
-	// Otherwise, we just set optionalFinished true and the result handles the whole ranges.
-	optionalResult distsql.SelectResult
-	result         distsql.SelectResult
-
-	optionalFinished bool
-}
-
-func (tr *tableResultHandler) open(optionalResult, result distsql.SelectResult) {
-	if optionalResult == nil {
-		tr.optionalFinished = true
-		tr.result = result
-		return
-	}
-	tr.optionalResult = optionalResult
-	tr.result = result
-	tr.optionalFinished = false
-}
-
-func (tr *tableResultHandler) nextChunk(ctx context.Context, chk *chunk.Chunk) error {
-	if !tr.optionalFinished {
-		err := tr.optionalResult.Next(ctx, chk)
-		if err != nil {
-			return errors.Trace(err)
-		}
-		if chk.NumRows() > 0 {
-			return nil
-		}
-		tr.optionalFinished = true
-	}
-	return tr.result.Next(ctx, chk)
-}
-
-func (tr *tableResultHandler) nextRaw(ctx context.Context) (data []byte, err error) {
-	if !tr.optionalFinished {
-		data, err = tr.optionalResult.NextRaw(ctx)
-		if err != nil {
-			return nil, errors.Trace(err)
-		}
-		if data != nil {
-			return data, nil
-		}
-		tr.optionalFinished = true
-	}
-	data, err = tr.result.NextRaw(ctx)
-	if err != nil {
-		return nil, errors.Trace(err)
-	}
-	return data, nil
-}
-
-func (tr *tableResultHandler) Close() error {
-	err := closeAll(tr.optionalResult, tr.result)
-	tr.optionalResult, tr.result = nil, nil
-	return errors.Trace(err)
 }

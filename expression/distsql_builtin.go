@@ -25,7 +25,7 @@ import (
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util/codec"
 	"github.com/pingcap/tidb/util/mock"
-	tipb "github.com/pingcap/tipb/go-tipb"
+	"github.com/pingcap/tipb/go-tipb"
 )
 
 func pbTypeToFieldType(tp *tipb.FieldType) *types.FieldType {
@@ -45,49 +45,49 @@ func getSignatureByPB(ctx sessionctx.Context, sigCode tipb.ScalarFuncSig, tp *ti
 	base.tp = fieldTp
 	switch sigCode {
 	case tipb.ScalarFuncSig_CastIntAsInt:
-		f = &builtinCastIntAsIntSig{base}
+		f = &builtinCastIntAsIntSig{newBaseBuiltinCastFunc(base, false)}
 	case tipb.ScalarFuncSig_CastRealAsInt:
-		f = &builtinCastRealAsIntSig{base}
+		f = &builtinCastRealAsIntSig{newBaseBuiltinCastFunc(base, false)}
 	case tipb.ScalarFuncSig_CastDecimalAsInt:
-		f = &builtinCastDecimalAsIntSig{base}
+		f = &builtinCastDecimalAsIntSig{newBaseBuiltinCastFunc(base, false)}
 	case tipb.ScalarFuncSig_CastDurationAsInt:
-		f = &builtinCastDurationAsIntSig{base}
+		f = &builtinCastDurationAsIntSig{newBaseBuiltinCastFunc(base, false)}
 	case tipb.ScalarFuncSig_CastTimeAsInt:
-		f = &builtinCastTimeAsIntSig{base}
+		f = &builtinCastTimeAsIntSig{newBaseBuiltinCastFunc(base, false)}
 	case tipb.ScalarFuncSig_CastStringAsInt:
-		f = &builtinCastStringAsIntSig{base}
+		f = &builtinCastStringAsIntSig{newBaseBuiltinCastFunc(base, false)}
 	case tipb.ScalarFuncSig_CastJsonAsInt:
-		f = &builtinCastJSONAsIntSig{base}
+		f = &builtinCastJSONAsIntSig{newBaseBuiltinCastFunc(base, false)}
 
 	case tipb.ScalarFuncSig_CastIntAsReal:
-		f = &builtinCastIntAsRealSig{base}
+		f = &builtinCastIntAsRealSig{newBaseBuiltinCastFunc(base, false)}
 	case tipb.ScalarFuncSig_CastRealAsReal:
-		f = &builtinCastRealAsRealSig{base}
+		f = &builtinCastRealAsRealSig{newBaseBuiltinCastFunc(base, false)}
 	case tipb.ScalarFuncSig_CastDecimalAsReal:
-		f = &builtinCastDecimalAsRealSig{base}
+		f = &builtinCastDecimalAsRealSig{newBaseBuiltinCastFunc(base, false)}
 	case tipb.ScalarFuncSig_CastDurationAsReal:
-		f = &builtinCastDurationAsRealSig{base}
+		f = &builtinCastDurationAsRealSig{newBaseBuiltinCastFunc(base, false)}
 	case tipb.ScalarFuncSig_CastTimeAsReal:
-		f = &builtinCastTimeAsRealSig{base}
+		f = &builtinCastTimeAsRealSig{newBaseBuiltinCastFunc(base, false)}
 	case tipb.ScalarFuncSig_CastStringAsReal:
-		f = &builtinCastStringAsRealSig{base}
+		f = &builtinCastStringAsRealSig{newBaseBuiltinCastFunc(base, false)}
 	case tipb.ScalarFuncSig_CastJsonAsReal:
-		f = &builtinCastJSONAsRealSig{base}
+		f = &builtinCastJSONAsRealSig{newBaseBuiltinCastFunc(base, false)}
 
 	case tipb.ScalarFuncSig_CastIntAsDecimal:
-		f = &builtinCastIntAsDecimalSig{base}
+		f = &builtinCastIntAsDecimalSig{newBaseBuiltinCastFunc(base, false)}
 	case tipb.ScalarFuncSig_CastRealAsDecimal:
-		f = &builtinCastRealAsDecimalSig{base}
+		f = &builtinCastRealAsDecimalSig{newBaseBuiltinCastFunc(base, false)}
 	case tipb.ScalarFuncSig_CastDecimalAsDecimal:
-		f = &builtinCastDecimalAsDecimalSig{base}
+		f = &builtinCastDecimalAsDecimalSig{newBaseBuiltinCastFunc(base, false)}
 	case tipb.ScalarFuncSig_CastDurationAsDecimal:
-		f = &builtinCastDurationAsDecimalSig{base}
+		f = &builtinCastDurationAsDecimalSig{newBaseBuiltinCastFunc(base, false)}
 	case tipb.ScalarFuncSig_CastTimeAsDecimal:
-		f = &builtinCastTimeAsDecimalSig{base}
+		f = &builtinCastTimeAsDecimalSig{newBaseBuiltinCastFunc(base, false)}
 	case tipb.ScalarFuncSig_CastStringAsDecimal:
-		f = &builtinCastStringAsDecimalSig{base}
+		f = &builtinCastStringAsDecimalSig{newBaseBuiltinCastFunc(base, false)}
 	case tipb.ScalarFuncSig_CastJsonAsDecimal:
-		f = &builtinCastJSONAsDecimalSig{base}
+		f = &builtinCastJSONAsDecimalSig{newBaseBuiltinCastFunc(base, false)}
 
 	case tipb.ScalarFuncSig_CastIntAsTime:
 		f = &builtinCastIntAsTimeSig{base}
@@ -278,6 +278,8 @@ func getSignatureByPB(ctx sessionctx.Context, sigCode tipb.ScalarFuncSig, tp *ti
 		f = &builtinArithmeticDivideRealSig{base}
 	case tipb.ScalarFuncSig_AbsInt:
 		f = &builtinAbsIntSig{base}
+	case tipb.ScalarFuncSig_AbsUInt:
+		f = &builtinAbsUIntSig{base}
 	case tipb.ScalarFuncSig_AbsReal:
 		f = &builtinAbsRealSig{base}
 	case tipb.ScalarFuncSig_AbsDecimal:
@@ -288,6 +290,8 @@ func getSignatureByPB(ctx sessionctx.Context, sigCode tipb.ScalarFuncSig, tp *ti
 		f = &builtinCeilIntToDecSig{base}
 	case tipb.ScalarFuncSig_CeilDecToInt:
 		f = &builtinCeilDecToIntSig{base}
+	case tipb.ScalarFuncSig_CeilDecToDec:
+		f = &builtinCeilDecToDecSig{base}
 	case tipb.ScalarFuncSig_CeilReal:
 		f = &builtinCeilRealSig{base}
 	case tipb.ScalarFuncSig_FloorIntToInt:
@@ -296,6 +300,8 @@ func getSignatureByPB(ctx sessionctx.Context, sigCode tipb.ScalarFuncSig, tp *ti
 		f = &builtinFloorIntToDecSig{base}
 	case tipb.ScalarFuncSig_FloorDecToInt:
 		f = &builtinFloorDecToIntSig{base}
+	case tipb.ScalarFuncSig_FloorDecToDec:
+		f = &builtinFloorDecToDecSig{base}
 	case tipb.ScalarFuncSig_FloorReal:
 		f = &builtinFloorRealSig{base}
 
@@ -610,9 +616,8 @@ func convertFloat(val []byte, f32 bool) (*Constant, error) {
 }
 
 func convertDecimal(val []byte) (*Constant, error) {
-	_, dec, err := codec.DecodeDecimal(val)
+	_, dec, precision, frac, err := codec.DecodeDecimal(val)
 	var d types.Datum
-	precision, frac := dec.PrecisionAndFrac()
 	d.SetMysqlDecimal(dec)
 	d.SetLength(precision)
 	d.SetFrac(frac)

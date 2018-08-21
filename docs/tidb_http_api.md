@@ -70,12 +70,6 @@
     curl http://{TiDBIP}:10080/mvcc/txn/{startTS}/{db}/{table}
     ```
 
-1. Get MVCC Information of the key with a specified handle ID
-
-    ```shell
-    curl http://{TiDBIP}:10080/mvcc/txn/{startTS}
-    ```
-
 1. Get MVCC Information by a hex value
 
     ```shell
@@ -94,6 +88,40 @@ timezone.*
 
     ```shell
     curl http://{TiDBIP}:10080/settings
+    ```
+
+1. Get TiDB server information.
+
+    ```shell
+    curl http://{TiDBIP}:10080/info
+    ```
+
+1. Get TiDB cluster all servers information.
+
+    ```shell
+    curl http://{TiDBIP}:10080/info/all
+    ```
+
+1. Enable/Disable TiDB server general log
+
+    ```shell
+    curl -X POST -d "tidb_general_log=1" http://{TiDBIP}:10080/settings
+    curl -X POST -d "tidb_general_log=0" http://{TiDBIP}:10080/settings
+    ```
+
+1. Change TiDB server log level
+
+    ```shell
+    curl -X POST -d "log_level=debug" http://{TiDBIP}:10080/settings
+    curl -X POST -d "log_level=info" http://{TiDBIP}:10080/settings
+    ```
+
+1. Change TiDB DDL slow log threshold
+
+    The unit is millisecond.
+
+    ```shell
+    curl -X POST -d "ddl_slow_threshold=300" http://{TiDBIP}:10080/settings
     ```
 
 1. Get the column value by an encoded row and some information that can be obtained from a column of the table schema information. 

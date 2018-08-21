@@ -17,7 +17,6 @@ import (
 	"bytes"
 	"fmt"
 	"strconv"
-	"strings"
 
 	"github.com/juju/errors"
 	"github.com/pingcap/tidb/ast"
@@ -28,6 +27,7 @@ import (
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/table"
 	"github.com/pingcap/tidb/util/auth"
+	"github.com/pingcap/tidb/util/chunk"
 	"github.com/pingcap/tidb/util/kvcache"
 	"github.com/pingcap/tidb/util/ranger"
 )
@@ -40,6 +40,8 @@ type ShowDDL struct {
 // ShowDDLJobs is for showing DDL job list.
 type ShowDDLJobs struct {
 	baseSchemaProducer
+
+	JobNumber int64
 }
 
 // ShowDDLJobQueries is for showing DDL job queries sql.
@@ -151,7 +153,7 @@ func (e *Execute) optimizePreparedPlan(ctx sessionctx.Context, is infoschema.Inf
 		vars.PreparedParams = make([]interface{}, len(e.UsingVars))
 	}
 	for i, usingVar := range e.UsingVars {
-		val, err := usingVar.Eval(nil)
+		val, err := usingVar.Eval(chunk.Row{})
 		if err != nil {
 			return errors.Trace(err)
 		}
@@ -208,11 +210,10 @@ func (e *Execute) rebuildRange(p Plan) error {
 	switch x := p.(type) {
 	case *PhysicalTableReader:
 		ts := x.TablePlans[0].(*PhysicalTableScan)
-		cols := expression.ColumnInfos2ColumnsWithDBName(ts.DBName, ts.Table.Name, ts.Columns)
 		var pkCol *expression.Column
 		if ts.Table.PKIsHandle {
 			if pkColInfo := ts.Table.GetPkColInfo(); pkColInfo != nil {
-				pkCol = expression.ColInfo2Col(cols, pkColInfo)
+				pkCol = expression.ColInfo2Col(ts.schema.Columns, pkColInfo)
 			}
 		}
 		if pkCol != nil {
@@ -251,12 +252,11 @@ func (e *Execute) rebuildRange(p Plan) error {
 }
 
 func (e *Execute) buildRangeForIndexScan(sctx sessionctx.Context, is *PhysicalIndexScan) ([]*ranger.Range, error) {
-	cols := expression.ColumnInfos2ColumnsWithDBName(is.DBName, is.Table.Name, is.Columns)
-	idxCols, colLengths := expression.IndexInfo2Cols(cols, is.Index)
+	idxCols, colLengths := expression.IndexInfo2Cols(is.schema.Columns, is.Index)
 	ranges := ranger.FullRange()
 	if len(idxCols) > 0 {
 		var err error
-		ranges, _, _, _, err = ranger.DetachCondAndBuildRangeForIndex(sctx, is.conditions, idxCols, colLengths)
+		ranges, _, _, _, err = ranger.DetachCondAndBuildRangeForIndex(sctx, is.AccessCondition, idxCols, colLengths)
 		if err != nil {
 			return nil, errors.Trace(err)
 		}
@@ -319,8 +319,10 @@ type Insert struct {
 	tableSchema *expression.Schema
 	Columns     []*ast.ColumnName
 	Lists       [][]expression.Expression
-	Setlist     []*expression.Assignment
-	OnDuplicate []*expression.Assignment
+	SetList     []*expression.Assignment
+
+	OnDuplicate        []*expression.Assignment
+	Schema4OnDuplicate *expression.Schema
 
 	IsReplace bool
 
@@ -353,15 +355,16 @@ type Delete struct {
 
 // AnalyzeColumnsTask is used for analyze columns.
 type AnalyzeColumnsTask struct {
-	TableInfo *model.TableInfo
-	PKInfo    *model.ColumnInfo
-	ColsInfo  []*model.ColumnInfo
+	PhysicalTableID int64
+	PKInfo          *model.ColumnInfo
+	ColsInfo        []*model.ColumnInfo
 }
 
 // AnalyzeIndexTask is used for analyze index.
 type AnalyzeIndexTask struct {
-	TableInfo *model.TableInfo
-	IndexInfo *model.IndexInfo
+	// PhysicalTableID is the id for a partition or a table.
+	PhysicalTableID int64
+	IndexInfo       *model.IndexInfo
 }
 
 // Analyze represents an analyze plan
@@ -409,51 +412,102 @@ type Explain struct {
 	explainedPlans map[int]bool
 }
 
-// prepareExplainInfo4DAGTask generates the following information for every plan:
-// ["id", "parents", "task", "operator info"].
-func (e *Explain) prepareExplainInfo4DAGTask(p PhysicalPlan, taskType string, parentID string) {
-	childrenIDs := make([]string, 0, len(p.Children()))
-	for _, ch := range p.Children() {
-		childrenIDs = append(childrenIDs, ch.ExplainID())
-	}
-	childrenInfo := strings.Join(childrenIDs, ",")
-	operatorInfo := p.ExplainInfo()
-	count := string(strconv.AppendFloat([]byte{}, p.StatsInfo().count, 'f', 2, 64))
-	row := []string{p.ExplainID(), parentID, childrenInfo, taskType, operatorInfo, count}
-	e.Rows = append(e.Rows, row)
-}
-
-// prepareCopTaskInfo generates explain information for cop-tasks.
-// Only PhysicalTableReader, PhysicalIndexReader and PhysicalIndexLookUpReader have cop-tasks currently.
-func (e *Explain) prepareCopTaskInfo(plans []PhysicalPlan) {
-	for i, p := range plans {
-		var parentID string
-		if i+1 < len(plans) {
-			parentID = plans[i+1].ExplainID()
-		}
-		e.prepareExplainInfo4DAGTask(p, "cop", parentID)
-	}
-}
-
-// prepareRootTaskInfo generates explain information for root-tasks.
-func (e *Explain) prepareRootTaskInfo(p PhysicalPlan, parentID string) {
+// explainPlanInRowFormat generates explain information for root-tasks.
+func (e *Explain) explainPlanInRowFormat(p PhysicalPlan, taskType, indent string, isLastChild bool) {
+	e.prepareOperatorInfo(p, taskType, indent, isLastChild)
 	e.explainedPlans[p.ID()] = true
-	for _, child := range p.Children() {
+
+	// For every child we create a new sub-tree rooted by it.
+	childIndent := e.getIndent4Child(indent, isLastChild)
+	for i, child := range p.Children() {
 		if e.explainedPlans[child.ID()] {
 			continue
 		}
-		e.prepareRootTaskInfo(child.(PhysicalPlan), p.ExplainID())
+		e.explainPlanInRowFormat(child.(PhysicalPlan), taskType, childIndent, i == len(p.Children())-1)
 	}
+
 	switch copPlan := p.(type) {
 	case *PhysicalTableReader:
-		e.prepareCopTaskInfo(copPlan.TablePlans)
+		e.explainPlanInRowFormat(copPlan.tablePlan, "cop", childIndent, true)
 	case *PhysicalIndexReader:
-		e.prepareCopTaskInfo(copPlan.IndexPlans)
+		e.explainPlanInRowFormat(copPlan.indexPlan, "cop", childIndent, true)
 	case *PhysicalIndexLookUpReader:
-		e.prepareCopTaskInfo(copPlan.IndexPlans)
-		e.prepareCopTaskInfo(copPlan.TablePlans)
+		e.explainPlanInRowFormat(copPlan.indexPlan, "cop", childIndent, false)
+		e.explainPlanInRowFormat(copPlan.tablePlan, "cop", childIndent, true)
 	}
-	e.prepareExplainInfo4DAGTask(p, "root", parentID)
+}
+
+// prepareOperatorInfo generates the following information for every plan:
+// operator id, task type, operator info, and the estemated row count.
+func (e *Explain) prepareOperatorInfo(p PhysicalPlan, taskType string, indent string, isLastChild bool) {
+	operatorInfo := p.ExplainInfo()
+	count := string(strconv.AppendFloat([]byte{}, p.statsInfo().count, 'f', 2, 64))
+	row := []string{e.prettyIdentifier(p.ExplainID(), indent, isLastChild), count, taskType, operatorInfo}
+	e.Rows = append(e.Rows, row)
+}
+
+const (
+	// treeBody indicates the current operator sub-tree is not finished, still
+	// has child operators to be attached on.
+	treeBody = '│'
+	// treeMiddleNode indicates this operator is not the last child of the
+	// current sub-tree rooted by its parent.
+	treeMiddleNode = '├'
+	// treeLastNode indicates this operator is the last child of the current
+	// sub-tree rooted by its parent.
+	treeLastNode = '└'
+	// treeGap is used to represent the gap between the branches of the tree.
+	treeGap = ' '
+	// treeNodeIdentifier is used to replace the treeGap once we need to attach
+	// a node to a sub-tree.
+	treeNodeIdentifier = '─'
+)
+
+func (e *Explain) prettyIdentifier(id, indent string, isLastChild bool) string {
+	if len(indent) == 0 {
+		return id
+	}
+
+	indentBytes := []rune(indent)
+	for i := len(indentBytes) - 1; i >= 0; i-- {
+		if indentBytes[i] != treeBody {
+			continue
+		}
+
+		// Here we attach a new node to the current sub-tree by changing
+		// the closest treeBody to a:
+		// 1. treeLastNode, if this operator is the last child.
+		// 2. treeMiddleNode, if this operator is not the last child..
+		if isLastChild {
+			indentBytes[i] = treeLastNode
+		} else {
+			indentBytes[i] = treeMiddleNode
+		}
+		break
+	}
+
+	// Replace the treeGap between the treeBody and the node to a
+	// treeNodeIdentifier.
+	indentBytes[len(indentBytes)-1] = treeNodeIdentifier
+	return string(indentBytes) + id
+}
+
+func (e *Explain) getIndent4Child(indent string, isLastChild bool) string {
+	if !isLastChild {
+		return string(append([]rune(indent), treeBody, treeGap))
+	}
+
+	// If the current node is the last node of the current operator tree, we
+	// need to end this sub-tree by changing the closest treeBody to a treeGap.
+	indentBytes := []rune(indent)
+	for i := len(indentBytes) - 1; i >= 0; i-- {
+		if indentBytes[i] == treeBody {
+			indentBytes[i] = treeGap
+			break
+		}
+	}
+
+	return string(append(indentBytes, treeBody, treeGap))
 }
 
 func (e *Explain) prepareDotInfo(p PhysicalPlan) {
